@@ -23,6 +23,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from srms.environments.base import smooth_slowness, union_sdf, unit_geodesic_gradient
+
 Obstacle = tuple[float, ...]  # (*centre[dim], radius)
 
 _OBSTACLE_SEED_OFFSET = 5
@@ -55,7 +57,7 @@ class TorusEnvironment:
             raise ValueError(f"start has {len(self.start)} coords but dim={self.dim}")
         self.tangent_dim = self.dim
         self.domain: tuple[float, float] = (-float(np.pi), float(np.pi))
-        self.axis_labels: tuple[str, str] = ("θ1 (deg)", "θ2 (deg)")
+        self.axis_labels: tuple[str, str] = (r"$\theta_1$ (deg)", r"$\theta_2$ (deg)")
         self.render_extent: tuple[float, float, float, float] = (-180.0, 180.0, -180.0, 180.0)
         self.has_dense_gt = self.dim in (2, 3)  # dense fast marching tractable at 2-D and 3-D
         self.obstacles: tuple[Obstacle, ...] = self._sample_obstacles()
@@ -130,28 +132,29 @@ class TorusEnvironment:
         """Analytic flat-torus geodesic distance ‖wrap(θ − start)‖ (the known base)."""
         return jnp.linalg.norm(wrap(theta - start), axis=-1)
 
+    def grad_geodesic(self, x: jnp.ndarray) -> jnp.ndarray:
+        """``∇base`` at x — closed form, so ``base`` is never differentiated (see base.py)."""
+        return unit_geodesic_gradient(self, x)
+
     # ---- obstacle / slowness field -----------------------------------------
 
     def sdf(self, thetas: jnp.ndarray) -> jnp.ndarray:
         """Signed distance (wrapped) to the union of obstacle balls."""
         per = [jnp.linalg.norm(wrap(thetas - jnp.array(obs[:-1])), axis=-1) - obs[-1] for obs in self.obstacles]
-        return jnp.min(jnp.stack(per, axis=0), axis=0)
+        return union_sdf(per, thetas.shape[0])
 
     def slowness(self, thetas: jnp.ndarray) -> jnp.ndarray:
         """Smooth slowness: ~1 in free space, rising to slowness_max inside obstacles."""
-        return 1.0 + (self.slowness_max - 1.0) * jax.nn.sigmoid(-self.sdf(thetas) / self.slow_width)
+        return smooth_slowness(self.sdf(thetas), self.slowness_max, self.slow_width)
 
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy signed distance (host-side, for RRT*'s hot loop)."""
-        return np.min(
-            [np.linalg.norm(_wrap_np(points - np.array(obs[:-1])), axis=-1) - obs[-1] for obs in self.obstacles],
-            axis=0,
-        )
+        per = [np.linalg.norm(_wrap_np(points - np.array(obs[:-1])), axis=-1) - obs[-1] for obs in self.obstacles]
+        return union_sdf(per, len(points), np)
 
     def slowness_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy smooth slowness (host-side, for RRT*'s hot loop)."""
-        sdf = self.sdf_np(points)
-        return 1.0 + (self.slowness_max - 1.0) / (1.0 + np.exp(sdf / self.slow_width))
+        return smooth_slowness(self.sdf_np(points), self.slowness_max, self.slow_width, np)
 
     # ---- sampling / ground truth --------------------------------------------
 

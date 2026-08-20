@@ -21,6 +21,69 @@ import jax.numpy as jnp
 import numpy as np
 
 
+# sdf value used where a scene has no obstacles: sigmoid(-1e3/slow_width) underflows to 0 in
+# float32, so slowness collapses to exactly 1 and the obstacle-free scene is a valid configuration.
+FREE_SPACE_SDF = 1e3
+
+
+def union_sdf(per: list, num_points: int, xp=jnp):
+    """Signed distance to an obstacle union.
+
+    Args:
+        per: Per-obstacle signed distances, each [n]. May be empty.
+        num_points: Number of query points, used to shape the obstacle-free result.
+        xp: Array module, ``jnp`` (default) or ``np``.
+
+    Returns:
+        Elementwise minimum over ``per``, [n]; ``FREE_SPACE_SDF`` everywhere when ``per`` is empty.
+    """
+    if not per:
+        return xp.full((num_points,), FREE_SPACE_SDF)
+    return xp.min(xp.stack(per, axis=0), axis=0)
+
+
+def smooth_slowness(sdf, slowness_max: float, slow_width: float, xp=jnp):
+    """Cost per unit length: ~1 in free space, rising to ``slowness_max`` inside obstacles.
+
+    Args:
+        sdf: Signed distance to the obstacle union, [n]; negative inside.
+        slowness_max: Slowness deep inside an obstacle.
+        slow_width: Width of the sigmoid ramp across the obstacle boundary.
+        xp: Array module, ``jnp`` (default) or ``np``.
+
+    Returns:
+        Slowness at each point, [n]. The exponent is clipped so ``FREE_SPACE_SDF`` does not
+        overflow NumPy's ``exp``; the clipped branch is saturated either way.
+    """
+    return 1.0 + (slowness_max - 1.0) / (1.0 + xp.exp(xp.clip(sdf / slow_width, -60.0, 60.0)))
+
+
+def unit_geodesic_gradient(env, x: jnp.ndarray) -> jnp.ndarray:
+    """``∇base`` at ``x``: the metric-unit covector pointing away from the source.
+
+    ``base(x)`` is the geodesic distance from ``env.start``, so its gradient is the unit tangent at
+    ``x`` along the geodesic, pointing away from the source — note **at x**, not at the source. The
+    direction is ``-log_map_ambient(x, start)``; dividing by its own metric norm makes
+    ``grad @ metric_inv @ grad == 1`` exactly, which is the identity the Eikonal residual is built on.
+
+    This exists so that ``base`` is never differentiated. On the sphere ``base = 2·arcsin(‖x−start‖/2)``
+    has an unbounded derivative as the chord approaches 2, so autodiff evaluates ``0 × inf`` at the
+    antipode and returns NaN: measured ``|∇base|`` of 1.1 at distance 1.0, 1.3e3 at 3.14, NaN at
+    3.1415. A uniformly sampled collocation batch reaches there routinely and training NaN'd within
+    60 steps. The closed form is bounded everywhere.
+
+    Args:
+        env: Environment supplying ``log_map_ambient``, ``metric_inv`` and ``start``.
+        x: One point on the manifold, [dim].
+
+    Returns:
+        Gradient covector at ``x``, [dim], with unit norm under ``metric_inv``.
+    """
+    direction = -env.log_map_ambient(x, jnp.asarray(env.start, dtype=x.dtype))
+    metric = env.metric_inv(x)
+    return direction / jnp.sqrt(jnp.einsum("i,ij,j->", direction, metric, direction) + 1e-30)
+
+
 @runtime_checkable
 class Environment(Protocol):
     dim: int  # point-representation dimension (= ambient dimension; equals tangent_dim for flat charts)
@@ -109,6 +172,16 @@ class Environment(Protocol):
 
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy counterpart of sdf, for RRT*'s hot loop."""
+        ...
+
+    def in_domain_np(self, points: np.ndarray) -> np.ndarray:
+        """True where a point lies on the manifold at all (host-side). Default: everywhere.
+
+        Distinct from ``sdf > 0``. An obstacle is *traversable at high cost* — the scene models it as
+        slowness, not as a hard collision — whereas a point outside the domain has no field value at
+        all. Only the truncated hyperbolic charts have such points: the Poincaré ball's grid and
+        sampler cover the chart *box*, whose corners fall outside the ball.
+        """
         ...
 
     # ---- sampling / ground truth ---------------------------------------------------------------

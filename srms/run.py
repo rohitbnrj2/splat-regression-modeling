@@ -19,11 +19,12 @@ import tyro
 
 from srms.environments import ENVIRONMENTS, sampling
 from srms.methods.backends import BACKENDS
-from srms.methods.strategies import eikonal, hntfields, ntfields, pntfields, weak_supervision
+from srms.methods.strategies import eikonal, factored, hntfields, ntfields, pntfields, weak_supervision
 from srms.viz import render, render_prediction
 
 STRATEGIES = {
     "eikonal": eikonal,
+    "factored": factored,
     "weak_supervision": weak_supervision,
     "ntfields": ntfields,
     "pntfields": pntfields,
@@ -71,9 +72,9 @@ class Config:
 
     """
 
-    environment: Literal["torus", "sphere", "poincare_hyperbolic", "lorentz_hyperbolic"] = "torus"
+    environment: Literal["torus", "sphere", "so3", "poincare_hyperbolic", "lorentz_hyperbolic"] = "torus"
     dim: int = 2
-    method: Literal["eikonal", "weak_supervision", "ntfields", "pntfields", "hntfields"] = "eikonal"
+    method: Literal["eikonal", "factored", "weak_supervision", "ntfields", "pntfields", "hntfields"] = "eikonal"
     backend: Literal["srm", "mlp"] = "srm"
     # scene
     start: tuple[float, ...] | None = None
@@ -92,6 +93,7 @@ class Config:
     source_radius: float = 0.25
     n_sphere: int = 32
     physics_weight: float = 1.0
+    nonneg_weight: float = 1.0  # `factored`: enforces g >= 0, i.e. T >= base (travel cannot beat free space)
     # weak_supervision strategy (RRT*)
     rrt_iters: int = 350
     rrt_step: float = 0.5
@@ -135,12 +137,28 @@ class Config:
     prune_thresh: float = 5e-4
     spawn_scale: float = 0.3
     scale_floor: float = 0.07
+    num_anchors: int = 0  # sparse RRT* weak supervision; 0 disables
+    anchor_mode: str = "bounds"  # "equality" = RRT* costs pinned; "bounds" = sphere-pack two-sided hinge
+    anchor_weight: float = 1e-2  # historical lambda_R; a lower bound can be invalid, so it must nudge not dictate
+    # "equality" mode only: extra draw weight on tree nodes whose source geodesic is occluded. The
+    # anchors work by pinning T's *level* where the pointwise residual leaves it free, i.e. behind an
+    # obstacle, so placement beats count — 30 shadow-targeted anchors gave 0.0735 against 0.1192 for
+    # 30 uniform ones on the same tree at the same weight. 0 makes the draw uniform (the control arm).
+    anchor_shadow_pref: float = 3.0
+    bound_slack: float = 0.10  # lower bound = graph cost x (1 - slack), absorbing roadmap suboptimality
+    variational: bool = False  # maximise T subject to ‖∇T‖<=s (largest subsolution) instead of (q-1)^2
+    variational_lambda: float = 100.0
+    trunc_sigma: float = 0.0  # >0 gives each splat compact support, exactly 0 beyond this many sigma
+    l1_weight: float = 0.0  # L1 on the mixture weights; with the V>=0 clamp this is LASSO+projection
+    nonneg_weights: bool = False  # clamp V >= 0 so the splat mixture g is non-negative by construction
+    max_aspect: float = 0.0  # >0 lets splats stretch: lower bound becomes max(scale_floor, s_max/max_aspect)
     # training / output
     num_splats: int = 384
     num_collocation: int = 2048
     steps: int = 4000
     lr: float = 3e-3
     init_scale: float = 0.35
+    init_weight: float = 0.0  # >0 required by `eikonal`: the unfactored field is dead at V=0
     resolution: int = 120
     seed: int = 1
     error_clip: float = 0.2
@@ -187,6 +205,16 @@ def _build_env(cfg: Config):
             slow_width=cfg.slow_width,
             seed=cfg.seed,
         )
+    if cfg.environment == "so3":
+        # SO(3) has no dimension argument: it is 3-dimensional, stored as a unit quaternion.
+        start = cfg.start if cfg.start is not None else (1.0, 0.0, 0.0, 0.0)
+        return ENVIRONMENTS["so3"](
+            start=start,
+            num_obstacles=cfg.num_obstacles,
+            slowness_max=cfg.slowness_max,
+            slow_width=cfg.slow_width,
+            seed=cfg.seed,
+        )
     if cfg.environment == "sphere":
         start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim + (1.0,)
         return ENVIRONMENTS["sphere"](
@@ -215,10 +243,9 @@ def main(cfg: Config) -> None:
     backend = BACKENDS[cfg.backend]
     dense = getattr(env, "has_dense_gt", cfg.dim == 2)  # env decides; 3-D grids are tractable now
 
-    thetas = shape = gt = inside = coords = edges = None
+    thetas = shape = inside = coords = edges = None
     if dense:
         thetas, shape = env.grid(cfg.resolution)
-        gt = env.ground_truth(cfg.resolution)
         inside = np.asarray(env.sdf(thetas)) < 0.0
         # duck-typed: only environments with a curvilinear chart (e.g. PoincareHyperbolicEnvironment's
         # Poincaré disk) define render_grid_xy/render_grid_edges_xy; torus/sphere fall back to
@@ -244,6 +271,10 @@ def main(cfg: Config) -> None:
             )
         if cfg.method in _NTFIELDS_FAMILY:
             return np.asarray(ntfields.predict(backend, current, thetas, env, cfg.tau_bias, cfg.tau_min))
+        if cfg.method == "factored":
+            # Without this the CLI would fall through and score the raw mixture g instead of
+            # T = base·exp(g) — a silently wrong field, not an error.
+            return np.asarray(factored.predict(backend, current, thetas, env, cfg))
         return np.asarray(eikonal.predict(backend, current, thetas, env))
 
     checkpoint = None

@@ -946,3 +946,1255 @@ beats B4's 30-anchor 0.169, all mesh-free/sparse. **High-D outlook: cautiously p
 reliably corrects a rough planner, but there is a floor set by how sparse the planner can be; that
 floor-vs-dimension is the next thing to characterise. This vindicates the *noisy-prior + physics-refine*
 thesis and, crucially, shows the Eikonal — not the base — is the corrector.
+
+---
+
+## 2026-08-19 — Package cleanup, six defects fixed, and the obstacle-free gate
+
+Session goal: audit the code for bugs, cut what is not needed, and define the training strategy for
+the planned experiment ladder (Exp 1 no obstacles → Exp 2 one obstacle → Exp 3 many, 2-D, 5 seeds).
+
+### Defects found and fixed
+
+| # | Where | Defect | Status |
+|---|---|---|---|
+| 1 | `methods/strategies/eikonal.py` | Residual was `‖∇T‖ − 1/s`. `slowness` is cost per unit length, so `T = ∫s dl` and `‖∇T‖ = s`. `manifolds.md` §6a records this as fixed; it was not fixed in this tree. | fixed |
+| 2 | all `environments/*` | `num_obstacles=0` raised `ValueError: need at least one array to stack` — **Experiment 1's exact configuration could not be constructed on any manifold.** | fixed |
+| 3 | `environments/lorentz_hyperbolic.py` | No `splat_precompute` / `log_and_jac`, both required by `srm.eval_raw`, so the environment could not be trained with the SRM backend at all. | fixed |
+| 4 | `environments/test_selfsupervised.py` | Referenced `ENVIRONMENTS["hyperbolic"]`, removed when hyperbolic split into Poincaré/Lorentz; `KeyError` outside the `try`, so the whole suite died. | fixed |
+| 5 | `run.py` | Computed `env.ground_truth` *before* training and again after, contradicting its own docstring that ground truth exists only post-`solve`. Not a contamination (it was never passed to `solve`) but the stated invariant was false. | fixed |
+| 6 | `methods/strategies/eikonal.py` | No densification wiring, while `cfg.densify` defaults True — the config claimed adaptive capacity the strategy never used. | fixed |
+| 7 | `environments/test_manifolds.py` | `containment_mass` applied the 2-D closed form `1 − exp(−R²/2σ²)` to SO(3), whose tangent space is 3-D: predicted 0.9675 where the chi₃ value is 0.9233 against a measured 0.9225. The standing mass-check failure was **the formula's, not the model's**. | fixed |
+
+Convention for #1 settled by measurement, not by reading: finite-differencing the fast-marching
+field on the 2-D torus gives median `‖∇T‖/s` = **0.999** inside obstacles and **1.004** in free
+space, against `‖∇T‖·s` = 78.5 inside.
+
+Two checks added, both of which would have caught a defect above:
+
+- **`backend == reference`** in `test_manifolds.py`. `srm.eval_raw` does not call
+  `eval_wrapped_gaussian`; it re-implements the density batched, with the frame hoisted into
+  `splat_precompute` and the log map fused into `log_and_jac` — three chances to disagree with the
+  definition that nothing checked. They agree to ≤ 3e-11 on all five manifolds. (`srm.py`'s docstring
+  claimed it *delegated* to the reference; corrected.)
+- `test_selfsupervised.py` now covers all five environments and all 15 strategy × manifold pairs:
+  **0 violations**.
+
+### Experiment 1 gate: the unfactored Eikonal objective prefers a wrong field
+
+`srms/experiments/sweep.py`. Obstacle-free torus T², `eikonal` strategy (unfactored `T = SRM(x)`),
+256 splats, 1500 steps, 3 seeds. With no obstacles the answer *is* the analytic geodesic, so this is
+the easiest test that exists.
+
+| seed | trained | do nothing | ceiling | cost@trained | cost@ceiling |
+|---|---|---|---|---|---|
+| 1 | 2.6302 | 0.0463 | 0.0794 | 0.00996 | 0.22764 |
+| 2 | 2.6212 | 0.0463 | 0.1310 | 0.01190 | 0.78728 |
+| 3 | 2.6821 | 0.0463 | 0.2109 | 0.01314 | 2.19735 |
+
+`do nothing` is `T = geodesic`, exact here, so 0.0463 is the fast-marching grid's own discretisation
+error. `ceiling` is the same splat basis least-squares fitted to the truth. **The trained field is
+57× worse than doing nothing**, and the objective is **20–170× lower** at the trained field than at
+the fitted-to-truth field, on every seed.
+
+What the optimizer found, measured: `|∇T|` median **1.007** (p05 0.747, p95 1.125 — the PDE is
+satisfied), field range **[−1.15, 1.21]** against the truth's [0.03, 4.42], and correlation with the
+truth **0.053**. It is a small-amplitude sawtooth: a genuine solution of `|∇T| = s` that is not the
+viscosity solution.
+
+**This is a formulation result, not an optimizer result.** `|∇T| = s` on a compact manifold has
+infinitely many Lipschitz solutions and the pointwise squared residual cannot distinguish them.
+Worse, it actively *prefers* the wrong ones: the true field is singular at the source and kinked at
+the cut locus, so any smooth approximation to it carries a large residual there, while a sawtooth is
+smooth almost everywhere. Capacity, learning rate and optimizer are all irrelevant to this.
+
+This reproduces, on the obstacle-free case, what `results/lm_optimizer_note.md` found with LM and
+continuation (cost 401.8 at the best-RMS checkpoint vs 59.6 at the drifted endpoint). That result was
+open to a "shadow under-determination" reading; **with zero obstacles there are no shadows**, so the
+cause is the objective itself.
+
+Consequence for the experiment ladder: Exp 1 cannot be run with the unfactored field as it stands.
+It also cannot be run with the factored fields (`T = base/τ`, `T = base·exp(g)`) as a *test*, because
+with no obstacles those are solved by their own initialisation — `τ ≡ 1` and `g ≡ 0` give the exact
+answer before a single step. The formulation has to supply what the pointwise residual does not.
+Options and the recommendation are in `results/training_strategy.md`.
+
+### Cull
+
+Root scripts of the retired `torus.py` lineage → `_archive/torus_lineage/` (21 files, all unimported
+by `srms/`). `srms/lib/{nets,cgls_reference_solver,test_identification,splat}.py` → `_archive/
+lib_preexisting/` (no importers; `test_identification.py` imported a `v2.lib` package that does not
+exist). `manifold_splat.py` trimmed 358 → 36 lines: only `eval_wrapped_gaussian` had a caller, the
+S²/SE(2) primitives being superseded by `srms/environments`. Empty `backends/kan.py` removed.
+Duplicated `sdf`-union and `slowness`-ramp code across five environments replaced by
+`environments/base.py`'s `union_sdf` / `smooth_slowness`.
+
+### Does the obstacle-free field need learning at all? No.
+
+With no obstacles the answer is the geodesic distance from the source, which is closed form
+(`env.geodesic`). Nothing needs to be learned. The only open question is whether a splat mixture can
+*hold* that field without gradient descent.
+
+It can. Centres sampled from the manifold, scales fixed isotropic, weights `V` by one ridge
+least-squares solve — no optimizer, no PDE, no schedule. **Scored against the analytic field, which
+is the true answer here.** 2-D torus:
+
+| splats | params | RMS vs analytic |
+|---|---|---|
+| 256 | 1,792 | 0.1054 |
+| 1024 | 7,168 | 0.0094 |
+| 4096 | 28,672 | 0.0085 |
+
+So the representation is not in question, and neither is "learning" in the gradient-descent sense.
+What the linear solve needs is a *known target*, which is exactly what obstacles remove.
+
+#### Correction — an earlier version of this section scored against fast marching, and was wrong
+
+The first draft reported these numbers against `env.ground_truth` (fast marching) and claimed the fit
+was "5x below the grid it is scored on". That statement is incoherent and the numbers were measuring
+the wrong thing. The basis was **fitted to** the FMM field and then **scored against** the FMM field,
+so a low number means it reproduced FMM, discretisation error included. You cannot score below your
+own reference. Measured, 1024 splats on the obstacle-free torus:
+
+| fitted to | RMS vs FMM | RMS vs analytic |
+|---|---|---|
+| FMM | 0.0094 | **0.0472** |
+| analytic | 0.0473 | **0.0094** |
+
+FMM's own distance from the analytic answer is 0.0463. The fit-to-FMM row reproduced that almost
+exactly: it learned the solver's error. `manifolds.md` §2 already stated the rule ("no solver RMS
+below these numbers is interpretable"); this section had violated it.
+
+**Rule, now enforced in code.** `experiments/sweep.py` scores obstacle-free runs against
+`env.geodesic` and only falls back to fast marching when obstacles make the closed form unavailable;
+`experiments/sweep.py` documents why. This also bounds what the existing headline numbers can mean:
+at resolution 120 the reference carries ~0.046 error, so a result of 0.24 is safely above it and a
+result of 0.04 is not — the weak-supervision 0.0417 in `manifolds.md` §5 is at the reference's own
+noise floor and should not be quoted as a precise value without re-scoring at higher resolution.
+
+### What the MLP comparison did and did not show
+
+An earlier version of this section asserted that "an MLP cannot represent the field" is not
+defensible. That over-reached, because the experiment behind it does not test that claim.
+
+What was actually run: **supervised regression onto ground-truth labels**, 4000 steps of Adam. A
+SIREN given ambient `(x, y, z)` reached 0.0074 on the sphere; the same network given the repo's
+`sin/cos` features reached 0.2500. So *label-supervised interpolation of a field you already have*
+works for an MLP given sensible input coordinates. That is curve fitting, not modelling a manifold
+and not predicting time-to-go, and it says nothing about whether an MLP can learn the field
+**without labels** from the physics loss — which is the setting this project is actually in, and
+which was not tested.
+
+The one measurement here that stands on its own is the encoding defect, which is independent of the
+comparison: `mlp.py`'s Fourier features place the two poles of S² **1.75e-07** apart when they are pi
+apart on the manifold, so with that encoding the network cannot separate them. That reproduces
+`manifolds.md`'s finding and is a property of the encoding, not of MLPs.
+
+Note also that the torus MLP number from that run (0.0250 vs FMM) is below FMM's own 0.0463 error and
+is therefore uninterpretable for the same reason as above.
+
+This also settles what Exp 1 is for. It cannot be a test of the representation, because the
+representation trivially passes. It is a test of the **loss** — the only part that would still be
+needed when obstacles make the closed form unavailable. Run that way it fails (see the gate above).
+
+### RETRACTION — "the objective prefers a wrong field" was an artifact of a supervised fit
+
+The gate above compared the objective at the trained field against the objective at **a splat basis
+least-squares fitted to the truth**, and concluded from `0.010 < 9.9` that the objective's minimum is
+not the answer, i.e. a formulation failure no optimizer could fix. **That conclusion is withdrawn.**
+
+The supervised fit was the problem. A 512-splat basis fitted to the geodesic cone still has
+appreciable gradient error near the source and the cut locus, and the Eikonal residual reads that
+error, so the fitted field carried a large cost that had nothing to do with the objective. Removing
+the fit and substituting the **analytic** field directly into the loss — no model, no parameters,
+nothing fitted — gives the correct comparison:
+
+| seed | trained RMS | do nothing | cost@trained | cost@truth |
+|---|---|---|---|---|
+| 1 | 2.6890 | 0.0000 | 0.01125 | **0.00000** |
+| 2 | 2.6857 | 0.0000 | 0.00943 | **0.00000** |
+| 3 | 2.6835 | 0.0000 | 0.01055 | **0.00000** |
+
+`cost@truth` is exactly zero, as it must be: with no obstacles `‖∇d‖_g = 1 = s` everywhere and the
+boundary ring value is `eps·s(start) = eps`. Both terms vanish at the answer.
+
+**Corrected diagnosis.** The objective is correct — its global minimum *is* the true field. The
+solver converges to a local minimum at cost 0.011: a small-amplitude sawtooth with `|∇T|` median
+1.007 and correlation 0.053 with the answer. So this is a **non-convex optimisation failure**, not an
+under-determined objective, and the levers are the ones that escape bad minima — continuation on the
+slowness or on a viscosity parameter, a stronger or longer-held causal curriculum, and the boundary
+term's weight relative to the residual (currently 1:1, with 32 ring points against 2048 collocation
+points, so the only term that pins the solution branch is outvoted ~64:1).
+
+**Two earlier notes carried the same contamination and are deleted** (`results/lm_optimizer_note.md`,
+`results/staged_strategy_note.md`). Both concluded "the objective genuinely prefers a wrong field"
+from a comparison against a ground-truth-fitted splat field (`V_true` in `lm_staged_experiment.py`) —
+the identical error. Their one surviving claim, unaffected by it: on a *frozen* basis (`A`, `B` fixed)
+the field is linear in `V`, so the residual Jacobian is closed form and Levenberg-Marquardt applies,
+which Adam's lack of a line search does not allow. `lm_staged_experiment.py` still implements it; its
+reported numbers should not be reused.
+
+**Rule, now stated in `experiments/sweep.py`: no supervised fit anywhere in this ladder, not even as a
+diagnostic.** Every experiment is self-supervised; a fit-to-truth measures representation capacity,
+which is not a question any of these experiments ask, and it silently corrupted the one comparison it
+was introduced to support. `srms/experiments/ceiling.py` deleted.
+
+### NTFields formulation on the obstacle-free torus: the free-space answer is not representable
+
+Ran the NTFields loss verbatim (`isotropic_loss(q) = |1−√q| + |1−1/√q|`, `q = ‖∇T‖_g/s`,
+`T = base/τ`, `τ = σ(SRM+4)`) on T² with zero obstacles, scored against the analytic geodesic.
+The `init` column is the field *before training*:
+
+| seed | init | trained | cost@init | cost@trained | cost@truth |
+|---|---|---|---|---|---|
+| 1 | 0.0473 | 0.0298 | 0.01854 | 0.00040 | 0.00000 |
+| 2 | 0.0470 | 0.0294 | 0.01818 | 0.00041 | 0.00000 |
+| 3 | 0.0464 | 0.0306 | 0.01765 | 0.00039 | 0.00000 |
+
+Training does improve the field (0.047 → 0.030) and the loss drops 45x, so nothing is diverging. But
+it stalls, and the reason is structural, not optimisation:
+
+- `τ = σ(raw + tau_bias)` lies in the **open** interval (0, 1). At init `σ(4) = 0.98201`, so
+  `T = 1.01832·base` — a uniform 1.83% overestimate.
+- Measured error by distance from the source: **1.83% at every band** (0-0.5, 0.5-1.5, 1.5-2.5,
+  2.5-3.5, 3.5-5.0). It is a pure scale factor, not a near-source or far-field defect.
+- At the source, `T = 0` exactly (`base(start) = 0`, correct by construction), but `‖∇T‖ = 1.01832`
+  where it must be 1.
+- With no obstacles the true field is exactly `base`, which needs `τ ≡ 1`, which needs `raw → +∞`.
+  **The formulation cannot represent the answer**; it can only approach it, and the optimizer is
+  pushing `raw` up against a sigmoid's tail.
+
+`cost@truth = 0` confirms the loss is right about the target: `q = ‖∇d‖_g/s = 1` gives
+`|1−1| + |1−1| = 0`. So the loss is correct and the *field parameterisation* is what bars the answer.
+
+**Candidate fix (not implemented — for review).** Replace the sigmoid with a form in which the
+free-space answer is exactly attainable, e.g. `T = base·(1 + relu(g))`:
+
+- `T(start) = 0` still holds by construction;
+- `T ≥ base` is enforced, which is correct whenever `slowness ≥ 1` (travel time can never beat the
+  free-space geodesic);
+- `g ≤ 0` gives `T = base` **exactly**, so free space is representable rather than asymptotic;
+- `‖∇T‖ = 1` exactly wherever the field is unobstructed.
+
+Raising `tau_bias` (`σ(8) = 0.99966`, 0.03% error) hides the symptom without removing the barrier.
+
+### Experiment 1 PASSES with `T = base·exp(g)` — the sigmoid was the barrier
+
+Symbols: `x` a point on the manifold, `T(x)` the time-to-go, `base(x)` the analytic geodesic distance
+from the source (closed form), `g(x)` the splat mixture's scalar output, `s(x)` the slowness.
+
+Replacing NTFields' `T = base/tau`, `tau = sigmoid(g + 4)` with `T = base·exp(g)`, same Eikonal
+residual, same optimizer, same budget, obstacle-free torus, scored against the analytic answer:
+
+| field | init | trained | recovery |
+|---|---|---|---|
+| `T = base/tau` (NTFields) | 0.0473 | 0.0298 | 1.6x |
+| **`T = base·exp(g)`** | 0.0836 | **0.0015** | **56x** |
+
+0.0015 is 30x below fast marching's own error at this resolution (0.046), and the training loss falls
+to ~1e-5. **The self-supervised Eikonal loss recovers the time-to-go field on the torus.** Note the
+initialisation is a *random perturbation* (`init_weight = 1e-2`, so `g` starts small and random, not
+zero) — at `g = 0` the field would be exactly `base` and there would be nothing to recover. So this is
+a genuine recovery from a perturbed start, not a fixed point being held.
+
+**Why `exp` and not `1 + relu(g)`**, which was the first suggestion and is worse: both make `T = base`
+exactly attainable, and `relu` would additionally enforce `T >= base` (correct whenever `s >= 1`,
+since travel cannot beat the free-space geodesic). But `relu` is flat for `g < 0`, so a correction
+that goes negative has zero gradient and can never come back — the same dead-gradient failure that
+made the unfactored field untrainable from `V = 0`. `exp` is smooth everywhere, has derivative 1 at
+`g = 0` so it is well conditioned exactly at the free-space solution, and matches the `base ·
+exp(correction)` already used in `weak_supervision.py`. The `T >= base` constraint is left to the
+physics rather than hardcoded.
+
+Implemented as `srms/methods/strategies/factored.py` (`--method factored`). It uses `(q − 1)²` as the
+residual rather than NTFields' `|1−√q| + |1−1/√q|`, which is non-differentiable at exactly `q = 1` —
+the point every run is trying to reach. `ntfields.py` is untouched and remains the paper baseline.
+No boundary-ring term is needed: `T(start) = 0` holds by construction for any finite `g`.
+
+Next: the same gate on the sphere and hyperbolic, then Exp 2 (one obstacle).
+
+### Two cut-locus defects found by running the gate on curved manifolds
+
+Extending Experiment 1 from the torus to the sphere, hyperbolic and SO(3) exposed two independent
+bugs, both at the **cut locus** (the far side of the manifold from a reference point), and both
+invisible on the flat torus.
+
+**Defect 8 — `base` must never be differentiated.** `T = base·exp(g)` was differentiated whole, so
+autodiff hit `base` itself. On S², `base = 2·arcsin(‖x−start‖/2)` has an unbounded derivative as the
+chord approaches 2. Measured ambient `|∇base|`: 1.1 at distance 1.0, 48 at 3.10, 1.3e3 at 3.14, NaN
+at 3.1415. Uniform collocation reaches there routinely and sphere training NaN'd within 60 steps.
+
+Fixed by giving every environment a `grad_geodesic(x)` in closed form: `∇base` is the metric-unit
+covector `-log_map_ambient(x, start)`, normalised. `time_grad` then differentiates only `g`, which is
+a smooth Gaussian mixture. Verified equivalent to autodiff where autodiff is defined (max relative
+difference 2.7e-07 on the torus, 2.3e-04 on the sphere under the metric — the raw vectors differ only
+by a radial component that `metric_inv` annihilates) and finite where it is not.
+
+Note the first attempt at this was wrong in a way the torus hid: `∇base` was written as the tangent
+**at `start`** pointing toward `x`, when it is the tangent **at `x`** pointing away from `start`. On a
+flat chart those coincide, so it passed on the torus and would have been silently wrong on every
+curved manifold.
+
+**Defect 9 — the wrapped Gaussian evaluated an antipodal point as if it sat at its own centre.**
+In `sphere._theta_perp`, `perp = x − cos(theta)·mu` vanishes exactly at the antipode of the splat
+centre, and `perp / max(‖perp‖, 1e-8)` then returned the **zero vector** rather than a unit one. With
+`e_perp = 0` the log map is 0, so the density was evaluated at the centre and multiplied by a
+`jac_factor` of pi/1e-8: measured **2.04e8** where the true value is ~1e-18. Separately, `arcsin`
+reaches argument 1 there, where its derivative is infinite, so `d/dB` was NaN.
+
+Fixed with an explicit unit tangent where the direction is genuinely undefined (any is correct — the
+Gaussian factor is e^-40 regardless) and by holding the `arcsin` argument off its endpoint. Antipodal
+density is now **6.85e-15** with all gradients finite.
+
+**This defect affects every strategy on the sphere, not only this one** — including the `ntfields`
+sphere result of 0.0545 recorded in `results/manifolds.md` §5, which was produced with splats
+returning 1e8 densities at their antipodes. It did not NaN there because `tau = sigmoid(.)` bounds the
+field, but that number should be treated as suspect and re-run.
+
+**Why the test suite missed both:** `sample_pairs` bounds separation at 1.8 rad and
+`points_near_source` at 1.8, so no existing check ever evaluated anything near pi. Added
+`‖∇base‖_g = 1 (cut locus)`, which samples the far side *empirically* — sorting a large pool by
+`env.geodesic` — rather than constructing an antipode analytically. That construction is not
+manifold-agnostic and my first version got it wrong on two manifolds: `-start` is the **same**
+rotation in SO(3), which is S³ quotiented by ±1, and lands on the **wrong sheet** of the hyperboloid
+in the Lorentz model. Suite now stands at **30 exact identities, 0 failures**.
+
+### Experiment 1, all four manifolds, one seed (5 seeds running)
+
+Self-supervised, no obstacles, `T = base·exp(g)`, 512 splats, 1500 steps, scored against the analytic
+geodesic. `init` is a randomly perturbed start (`init_weight = 1e-2`), not the answer.
+
+| manifold | curvature | init RMS | RMS | max | MAE | MAE far | recovery |
+|---|---|---|---|---|---|---|---|
+| torus T² | 0 | 0.0836 | 0.0046 | 0.0164 | 0.0035 | 0.0042 | 18x |
+| sphere S² | +1 | 0.0680 | **0.0004** | 0.0007 | 0.0003 | 0.0004 | **183x** |
+| Poincaré H² | −1 | 0.0383 | 0.0013 | 0.0078 | 0.0008 | 0.0011 | 31x |
+| SO(3) | ¼ | 0.0354 | 0.0009 | 0.0038 | 0.0006 | 0.0009 | 41x |
+
+`MAE far` (cells past half the maximum travel time) tracks `MAE` on every manifold, so the error is
+uniform rather than accumulating outward from the source. All four sit well below fast marching's own
+discretisation error at these resolutions, which is why the analytic reference is the one used.
+
+### Where curvature actually lives in this code
+
+Recorded because it was asked and the answers are not symmetric. Only two functions carry curvature —
+`metric_inv` (how gradients are measured) and `jac_factor` (the wrapped Gaussian's volume correction).
+Both are the same Jacobi-field expression at that manifold's `K`: `1` at `K=0`, `(r/sin r)^(d-1)` at
+`K=+1`, `(r/sinh r)^(d-1)` at `K=-1`, `((r/2)/sin(r/2))²` at `K=+1/4`.
+
+**T² is flat because it is a quotient of the plane by translations**, which are isometries — so every
+point has a neighbourhood isometric to a Euclidean disc and `K = 0` exactly. The doughnut picture
+misleads: that surface has varying curvature because its embedding in R³ induces a *different* metric,
+and the flat torus has no smooth isometric embedding in R³ (only in R⁴, as two orthogonal circles).
+Gauss-Bonnet separates topology from curvature cleanly: `∫K dA = 2·pi·chi` with `chi = 0` for a torus,
+so any metric on it averages to zero; flat attains it pointwise. In the code this is literal —
+`metric_inv = I`, `jac_factor = 1`, `log_map = wrap(x - mu)`.
+
+**SO(3)'s `K = 1/4` is convention-dependent.** For a bi-invariant metric on a compact group,
+`K(X,Y) = ¼‖[X,Y]‖²` on orthonormal `X, Y`; in `so(3)` the bracket is the cross product so
+`‖[X,Y]‖ = 1` and `K = ¼` on every plane. The number tracks scale: SO(3) = S³/±1 and we take distance
+to be the rotation angle, twice the unit-S³ great-circle distance, and doubling distance quarters
+curvature from S³'s `+1`. `so3.jac_factor = ((theta/2)/sin(theta/2))²` and the marcher's radial profile
+`2·sin(r/2)` both encode exactly that `K`. Note SO(3) is atypical: `K = 0` wherever `[X,Y] = 0`, so any
+group of rank >= 2 has flat 2-planes and non-constant curvature; SO(3) has rank 1 and so has neither.
+
+### Experiment 1 closed; the ladder collapsed into one runner
+
+Experiments 1/2/3 differ **only** in `--num-obstacles` (0 / 1 / many) — same field, loss, optimiser
+and budget — so `gate.py` and a half-written `obstacles.py` were merged into a single
+`srms/experiments/sweep.py`. The one thing that cannot be shared is the **scoring reference**, and it
+is a branch, not a second experiment:
+
+- 0 obstacles: the analytic geodesic. Exact, so every digit is real, and `cost@truth` (the objective
+  evaluated at the true answer) is available — the column that separates a wrong objective from an
+  unconverged solver.
+- 1+ obstacles: fast marching, which carries its own error. That error is measured per scene by
+  removing the obstacles, where the exact answer *is* known, printed as `ref err`, and the runner
+  warns when a result falls below it. `cost@truth` prints `—` rather than substituting a fitted
+  field, which is the error retracted earlier in this log.
+
+Two columns carry across the whole ladder: `MAE far` (cells past half the maximum travel time) and
+`MAE shadow` (cells whose straight source-to-point ray crosses an obstacle, from the scene's SDF
+alone — no solver). The merged runner reproduces the torus Exp 1 number exactly (0.0021 ± 0.0015 over
+5 seeds), confirming the merge is faithful.
+
+**Experiment 1 result of record — one seed per manifold, self-supervised, scored against the analytic
+field.** Multi-seed was dropped as unnecessary once every manifold passed:
+
+| manifold | K | init RMS | RMS | max | MAE | MAE far |
+|---|---|---|---|---|---|---|
+| torus T² | 0 | 0.0836 | 0.0046 | 0.0164 | 0.0035 | 0.0042 |
+| sphere S² | +1 | 0.0680 | 0.0004 | 0.0007 | 0.0003 | 0.0004 |
+| Poincaré H² | −1 | 0.0383 | 0.0013 | 0.0078 | 0.0008 | 0.0011 |
+| SO(3) | +1/4 | 0.0354 | 0.0009 | 0.0038 | 0.0006 | 0.0009 |
+
+For reference, the 5-seed means where they were collected: torus 0.0021 ± 0.0015, sphere
+0.0030 ± 0.0034 — so single-seed numbers sit inside seed noise and no ordering between manifolds
+should be read from them.
+
+### The basin of attraction is finite, and it is what Experiment 2 tests
+
+Exp 1 asks the physics to drive the correction `g` back to **zero**, since with no obstacles
+`T = base` is the answer. That is a stability result, not a discovery result. Measured on the torus by
+enlarging the initial perturbation (`init_weight`):
+
+| `init_weight` | init RMS | trained RMS | outcome |
+|---|---|---|---|
+| 0.01 | 0.084 | 0.0046 | recovers |
+| 0.05 | 0.410 | 0.0087 | recovers, 47x |
+| 0.2 | 1.892 | 1.576 | **fails — barely moves** |
+
+So the loss has a finite basin: it undoes an error of 0.41 completely and an error of 1.89 not at all.
+This is continuous with the unfactored `T = g(x)` failure, which is the same thing with no `base` at
+all. **The Exp 2 question is therefore not whether the splats can represent the shadow, but whether
+the correction the shadow demands lands inside that basin** — a measurable quantity, not a worry.
+
+### Directional stretching enabled (`--max-aspect`)
+
+The uniform per-axis scale floor forbids the useful anisotropy: at an obstacle's shadow crease the
+field is smooth along the crease and kinked across it, so a splat wants to be long one way and thin
+the other. Measured after 800 steps on the torus:
+
+| scene | median aspect | p95 | max | splats pinned at the floor |
+|---|---|---|---|---|
+| no obstacles | 1.09 | 1.25 | 1.58 | 0.0% |
+| one obstacle | 1.17 | 2.37 | 8.28 | **1.2%** |
+
+So splats stay isotropic when there is nothing to conform to and stretch as soon as an obstacle
+exists, with a fraction pinned. `post_step` now bounds the **condition number** instead of every axis:
+the effective lower bound is `max(scale_floor, s_max/max_aspect)`, so a splat may thin across a crease
+while `scale_floor` still prevents collapse to a point in every direction — the failure the floor was
+introduced for. Defaults to 0 (disabled), reproducing the old behaviour exactly. **Not yet validated:**
+whether loosening the floor reintroduces the divergence it was added to prevent. Check that on the
+obstacle-free case before trusting it in Exp 2, where it would be confounded with the shadow.
+
+### RETRACTED IN ADVANCE: "Exp 2 reproduces the historical 0.31 plateau"
+
+The first Experiment 2 torus number (RMS 0.3040, one obstacle) was reported as reproducing this log's
+historical pure-physics plateau of ~0.31 at *three* obstacles, and therefore as showing that level
+under-determination starts at a single obstacle. **That comparison is confounded four ways and the
+claim is withdrawn pending a matched run.**
+
+| | historical (0.2425) | first Exp 2 run (0.3040) |
+|---|---|---|
+| field / loss | `ntfields`, `base/tau`, isotropic | `factored`, `base·exp(g)`, `(q−1)²` |
+| capacity | **densify on, grew to 1947 splats** | **densify off, 512 fixed** |
+| steps | 4000 | 3000 |
+| causal weighting | ignored by `ntfields` | **on** |
+
+The likely dominant term is densification. The correction `g` is *spatially confined* — with
+`T = base·exp(g)` and the free-space answer at `g = 0`, only splats in and around the shadow need to
+move at all. Densification spawns capacity at the highest-residual points, i.e. exactly there;
+without it, 512 splats drawn from `sample_domain` are spread uniformly over the whole manifold and
+nothing concentrates them where the work is. `SweepConfig` had silently flipped the repo's
+`densify=True` default to `False`. Restored.
+
+Two further claims from that report are also premature and withdrawn: that directional stretching
+cannot help, and that the finite-basin measurement explains the failure. Both were derived at 512
+*fixed* splats, and spawning splats at high-residual points is itself a basin-escape mechanism.
+
+Matched arms now running on the same seed-1 one-obstacle scene, resolution 240, 4000 steps,
+densification on: (a) `ntfields` as the historical control, (b) `factored` with causal weighting,
+(c) `factored` without, (d) `factored` with causal weighting but no annealing. Nothing about level
+under-determination at one obstacle should be claimed until those land.
+
+### Defect 10 — `shadow_mask` was correct on exactly one manifold
+
+Found by review, before it reached a table. The ray was traced as
+`start + f·log_map_ambient(start, x)` then `wrap_point`, which is a flat-chart shortcut:
+
+- **torus** — correct.
+- **SO(3)** — **crash**: `log_map_ambient` returns the 3-component Lie-algebra element while `start`
+  is a 4-vector quaternion. The sweep would have trained SO(3) fully and then died at scoring.
+- **sphere** — silently wrong: the renormalised chord reaches angle `arctan(theta)` rather than
+  `theta` at `f=1`, so the far part of the path is never tested and shadows there are missed.
+- **Poincaré** — overshoots: the tangent's norm is a geodesic length exceeding the chart radius, so
+  `f=1` lands past `x`, often outside the ball, producing false shadows.
+
+Fixed with `Exp_start(f · Log_start(x))`, which is the geodesic on every manifold with correct
+endpoints, and which rests on the round-trip identity `test_manifolds.py` already verifies.
+
+**Process change: `srms/experiments/preflight.py`.** Every defect this session was found by an
+expensive run failing, and each had the same shape — right on the flat torus, wrong on a curved
+manifold, or right without obstacles and wrong with them. The pre-flight runs every manifold x
+{0, 1} obstacles for 10 steps through the *full* scoring, shadow-mask and figure path in about two
+minutes. It reports 8/8 passing now; it would have caught the SO(3) crash and the sphere ray. Run it
+before launching any sweep.
+
+### Experiment 2, matched arms: the correction must be non-negative, and that was the bug
+
+One obstacle, torus, seed 1, resolution 240, 4000 steps, densification on, identical scene and
+budget. Fast marching's own error here is 0.0273, so every number below is well clear of the floor.
+
+| arm | field | constraint on `g` | RMS | MAE shadow / MAE |
+|---|---|---|---|---|
+| (a) `ntfields` | `base/tau`, `tau = sigmoid` | `T > base` structurally | 0.2027 | 6.86x |
+| (b) `factored` causal ON | `base·exp(g)` | none | 0.2737 | 4.88x |
+| (c) `factored` causal OFF | `base·exp(g)` | none | 0.2610 | 4.16x |
+| (d) `factored` causal, no anneal | `base·exp(g)` | none | 0.2698 | 4.93x |
+| **(e) `factored` + `g >= 0`** | `base·exp(g)` | penalty | **0.1934** | **3.72x** |
+
+**Read (a) correctly.** This is *not* NTFields the paper, which is a Euclidean MLP over a workspace
+encoder. It is their **field parameterisation and loss** carried by *our* splat backend on *our*
+manifold machinery. So the comparison isolates the parameterisation, and nothing here says anything
+about MLP versus splat.
+
+**The finding.** With `s >= 1`, travel time can never beat the free-space geodesic, so `T >= base` and
+`g = log(T/base) >= 0`. Measured against the true field: `g_true` spans `[0, 0.763]` across 55,675
+cells with **no negative value**. `base·exp(g)` does not encode this, and the optimizer exploits it —
+after training, `g < 0` in **44.5%** of free-space cells and **30.7%** of shadow cells, averaging
+**0.277 below truth** in the shadow. That unphysical region *is* the large blue under-prediction area
+in the error maps.
+
+NTFields' sigmoid forbids it structurally (`tau` in (0,1) implies `T > base`), which is why (a) beat
+(b) with an obstacle while losing badly without one (0.0298 vs 0.0015, where the answer is `T = base`
+and a sigmoid cannot reach `tau = 1`). Each parameterisation held one half of what is needed.
+
+Adding a one-sided penalty `mean(min(g, 0)^2)` — exactly zero, with zero gradient, wherever the
+constraint holds, so the obstacle-free case is untouched by construction — takes `base·exp(g)` from
+0.2737 to **0.1934**, and the two formulations then agree to within 5% (0.1934 vs 0.2027). That is
+the predicted outcome: once both respect `g >= 0` they represent the same function class.
+
+**No smooth `psi(g)` can do both structurally.** Attaining `psi = 1` while staying `>= 1` makes that
+point a minimum, so `psi' = 0` there — a dead gradient exactly at the free-space solution, which is
+the defect that made the unfactored field untrainable from `V = 0`. Hence `exp` for conditioning plus
+an exterior penalty for the constraint, which is the standard treatment of an inequality constraint
+rather than a workaround.
+
+**Causal weighting is mildly harmful here** (b 0.2737 vs c 0.2610), and un-annealing it does not help
+(d 0.2698). Suspected cause, untested: `training_aids.causal_loss` orders points by `env.geodesic`,
+the **free-space** distance, which under-estimates arrival time behind an obstacle — so shadow points
+are un-muted before the wavefront has actually reached them, inverting the curriculum exactly where
+it is supposed to help.
+
+### CORRECTION — "the sigmoid cannot represent free space" was overstated
+
+This log claimed that NTFields' `T = base/tau`, `tau = sigmoid(g + tau_bias)`, **cannot** represent
+the obstacle-free answer, on the basis that `tau = 1` needs `g -> +inf`, and pointed at a measured
+1.83% uniform overestimate and a stall at RMS 0.0298. The mathematics is right and the practical
+conclusion was wrong: 1.83% is `sigmoid(4) = 0.98201`, i.e. **the default `tau_bias = 4`**, not the
+parameterisation. Re-run at `tau_bias = 8` (`sigmoid(8) = 0.99966`), same scene and budget:
+
+| arm | tau_bias | Exp 1 RMS (no obstacles) | Exp 2 RMS (one obstacle) |
+|---|---|---|---|
+| `ntfields` | 4 | 0.0298 | **0.2027** |
+| `ntfields` | 8 | **0.0006** | 0.2245 |
+| `factored` (`base·exp(g)`) | — | 0.0015 | 0.1934 (with `g >= 0`) |
+
+At `tau_bias = 8` NTFields reaches **0.0006** on the obstacle-free case — better than `base·exp(g)`.
+So free space is attainable to any precision that matters; the barrier was a bad default.
+
+**The real structural difference is a tension, not an impossibility, and it now has both ends
+measured.** Raising the bias fixes free space and *costs* accuracy with an obstacle (0.2027 -> 0.2245),
+because `sigmoid'(8) = 3.4e-4` — the field becomes slow to move away from `tau = 1` exactly when an
+obstacle demands that it does. Low bias represents obstacles well and free space badly; high bias the
+reverse. `base·exp(g)` has derivative 1 at `g = 0` regardless, so it has no such trade-off, which is a
+narrower and defensible claim than the one being corrected.
+
+### Best Experiment 2 arm so far
+
+| arm | field | constraint | causal | RMS | MAE shadow / MAE |
+|---|---|---|---|---|---|
+| (a) `ntfields` bias 4 | `base/tau` | structural | off | 0.2027 | 6.86x |
+| (h) `ntfields` bias 8 | `base/tau` | structural | off | 0.2245 | 7.03x |
+| (b) `factored` | `base·exp(g)` | none | on | 0.2737 | 4.88x |
+| (c) `factored` | `base·exp(g)` | none | off | 0.2610 | 4.16x |
+| (e) `factored` | `base·exp(g)` | penalty w=1 | on | 0.1934 | 3.72x |
+| (f) `factored` | `base·exp(g)` | penalty w=10 | on | 0.1985 | **2.72x** |
+| **(g) `factored`** | `base·exp(g)` | penalty w=1 | **off** | **0.1865** | 3.30x |
+
+Fast marching's own error is 0.0273, so all of these are well clear of the floor. Best is `g >= 0`
+enforced with causal weighting **off** — 0.1865, a 32% improvement on the unconstrained arm and 8%
+better than the NTFields formulation at its best bias. Note the two levers are close to independent:
+the constraint buys ~29% and dropping causal weighting a further ~4%.
+
+### Why the sphere is easy and hyperbolic will be hard: curvature controls shadow size
+
+Asked why S² scored so much better than T² at one obstacle. Measured, **matched obstacle radius
+(0.5–0.9), seed 1, resolution 240**, so the scenes are comparable:
+
+| manifold | K | obstacle % of volume | shadow % | median detour | max detour | do-nothing RMS |
+|---|---|---|---|---|---|---|
+| sphere S² | +1 | **12.6%** | **0.7%** | 1.0000 | 1.359 | 0.148 |
+| torus T² | 0 | 3.3% | 5.8% | 1.0146 | 2.145 | 0.320 |
+| Poincaré H² | −1 | 26.8%* | 6.5% | 1.0599 | 3.549 | 0.653 |
+
+*includes out-of-chart cells, which the rim marks as blocked.
+
+**On the sphere a ~4x larger obstacle casts an ~8x smaller shadow.** That is geodesic focusing: at
+K=+1 geodesics leaving the source reconverge toward the antipode, so paths bending around a cap
+rejoin almost immediately and the region genuinely requiring a detour is tiny. At K=0 they stay
+parallel, so the shadow is an open corridor extending far behind the obstacle and fed from only two
+sides. At K=−1 they diverge exponentially, which is why H² has both the largest shadow and by far the
+largest detours — the ordering sphere < torus < hyperbolic follows curvature +1, 0, −1 directly, and
+`do-nothing` RMS (0.148 / 0.320 / 0.653) tracks it.
+
+So **a low absolute RMS on the sphere is mostly the scene, not the method.** Report improvement over
+`do nothing`, never the raw number alone:
+
+| manifold | do-nothing | best RMS | improvement | FMM's own error |
+|---|---|---|---|---|
+| sphere | 0.1256 | 0.0071 | 17.7x | 0.0218 |
+| torus | 0.3197 | 0.1865 | 1.71x | 0.0281 |
+
+### CORRECTION — "below the floor" does not mean "better than fast marching"
+
+Twice in this session a result under the reference's own error was described as the field being "at
+least as accurate as the reference". **That is wrong and the phrasing is withdrawn.** The field is
+scored *against* fast marching, so the column is **agreement with FMM**, never accuracy. Agreeing
+with FMM to 0.0071 while FMM is 0.0218 from truth puts the true error in [0.015, 0.029] by the
+triangle inequality — unresolvable, and dominated by the reference's error rather than the model's.
+Nothing scored this way can ever be shown to beat the solver it is scored against. `sweep.py` now
+prints this explicitly instead of the word "floor".
+
+The reference-error measurement was also wrong for S². Taken at the configured start it reported
+**0.0000**, because the grid is geodesic-polar about the pole and the marcher was discretising a 1-D
+radial problem exactly; 45° off the pole the same grid gives 0.0134, at the equator 0.0166. It is now
+measured at three *generic* source positions and the worst taken: torus 0.0281, sphere 0.0218,
+Poincaré 0.0508.
+
+### L1 on the weights was not the lever
+
+Structural `V >= 0`, torus, one obstacle: no L1 0.2259, L1 1e-4 0.2223, L1 1e-3 0.2193. The
+free-space haze is not caused by too *many* active splats but by each splat reaching too far, which
+is what motivated compact support (user's suggestion — kill the Gaussian past ~1% of peak).
+
+### Compact support works, and reveals that ~0.19 on the torus is not a representation limit
+
+User's suggestion: kill each Gaussian past ~1% of its peak so it cannot influence the field globally.
+Implemented as a quintic-smoothstep window on the Mahalanobis radius (`cfg.trunc_sigma`, C² so the
+Eikonal residual sees no kink; support is an ellipsoid in whitened space, so it composes with
+`max_aspect`). Verified: a σ=0.35 splat is unchanged at 2σ and **exactly 0** past 3σ.
+
+Torus, one obstacle, seed 1, res 240, 4000 steps, structural `V >= 0`, causal off:
+
+| arm | RMS | max | MAE free space | MAE shadow |
+|---|---|---|---|---|
+| clamp only (control) | 0.2259 | **0.630** | 0.1810 | **0.2319** |
+| + compact 3σ | 0.1958 | 0.727 | 0.1560 | 0.3001 |
+| + compact 3σ + narrow spawns (0.18) | 0.1892 | 0.954 | 0.1451 | 0.3173 |
+| + compact 2σ | **0.1844** | 1.269 | **0.0935** | 0.5383 |
+| soft penalty instead of clamp | 0.1865 | 1.335 | 0.1177 | 0.3889 |
+
+**The idea works for what it targets** — free-space error nearly halves (0.181 → 0.094) as the
+splats become local. **But total RMS is pinned at ~0.19 across every configuration tried**: soft
+penalty 0.1865, clamp + 2σ 0.1844, clamp + 3σ + narrow spawns 0.1892. Each knob trades free-space
+error against shadow error and leaves the sum unchanged.
+
+That plateau is the informative part, and it has a mechanical explanation. A compactly-supported
+splat receives gradient only from collocation points *inside its own radius*, so it cannot carry
+level information into the shadow. The shadow's level is not a local quantity — it is the accumulated
+cost of a detour. Making splats more local fixes the leak and degrades that transport, which is
+exactly the observed trade (2σ gives the cleanest free space and the worst shadow).
+
+**Conclusion: the residual ~0.19 is not a representation limit.** The obstacle-free ceiling is ~0.003
+and free space is already at 0.094; what remains is the shadow *level*, which pointwise physics
+under-determines. Clamping, truncation and sparsity all act on representation and none of them move
+it. The mechanism that can move it is the training *ordering*.
+
+### The causal curriculum was ordering by the wrong quantity
+
+`training_aids.causal_loss` ordered collocation points by `env.geodesic` — the **free-space**
+distance. Behind an obstacle that is exactly backwards: a shadow point is *near* in free-space
+distance but *late* in arrival time, so it was un-muted long before the wavefront reached it,
+inverting the curriculum precisely where it was supposed to help. That explains the measured result
+that causal weighting made things *worse* (0.2737 with, 0.2610 without).
+
+`causal_loss` now takes an `order_by` key and `factored` passes the model's **own predicted `T`**
+(stop-gradient) — self-supervised, since it is the field being learned rather than any reference.
+Arms testing it are running.
+
+### Causal ordering by predicted arrival time: right fix, wrong size
+
+Torus, one obstacle, seed 1, res 240, 4000 steps, clamp + compact 3σ, only the ordering varying:
+
+| arm | RMS | max | MAE free | MAE shadow |
+|---|---|---|---|---|
+| ordered by predicted `T`, annealed | **0.1915** | 0.838 | 0.1520 | **0.2769** |
+| ordered by predicted `T`, un-annealed | 0.1975 | 0.817 | 0.1564 | 0.2909 |
+| causal off (control) | 0.1958 | **0.727** | 0.1560 | 0.3001 |
+
+The ordering key was genuinely wrong before and fixing it reverses the sign of the effect (causal
+weighting used to *hurt*: 0.2737 with, 0.2610 without). Shadow MAE now improves monotonically with
+the correct order, 0.3001 → 0.2769. But total RMS moves 2%, inside seed noise. **Not the lever.**
+
+### The ~0.19 plateau, and what it rules out
+
+Six mechanisms, spanning representation *and* optimisation, all land in 0.184–0.226 on the same scene:
+
+| mechanism | kind | RMS |
+|---|---|---|
+| soft penalty on `g < 0` | objective | 0.1865 |
+| structural clamp `V >= 0` | projection | 0.2259 |
+| clamp + compact support 2σ | representation | **0.1844** |
+| clamp + compact 3σ + narrow spawns | representation | 0.1892 |
+| clamp + compact 3σ + correct causal order | curriculum | 0.1915 |
+| L1 on weights | sparsity | 0.2193 |
+
+Against `do nothing` = 0.3197 that is a 1.7x improvement, pinned. The representational explanation is
+directly falsified: free space reaches MAE 0.094 while the shadow sits at 0.28–0.54, and the
+obstacle-free ceiling is ~0.003. **What remains is the shadow *level*, and the pointwise residual
+does not determine it.**
+
+**Why no local fix can.** The loss is `(‖∇T‖/s − 1)²` evaluated pointwise. It constrains the
+*gradient* of `T` and says nothing about its value. Behind an obstacle the level is the accumulated
+cost of a detour — a path integral, not a local quantity — so a field that is off by a constant there
+has near-zero residual. Compact support makes this worse by construction, which is exactly the
+measured trade (2σ: cleanest free space 0.094, worst shadow 0.538).
+
+### The variational reformulation — the untried lever that targets this directly
+
+The Eikonal equation *does* determine the level uniquely; the pointwise residual is simply the wrong
+way to extract it. The value function has a variational characterisation:
+
+    T = max { u : ‖∇u‖ <= s everywhere, u(start) = 0 }
+
+Any `u` with `‖∇u‖ <= s` grows at most at rate `s` along any path, so `u(x) <= ∫ s dl` for every path
+and hence `u(x) <= T(x)`. The true field is the **largest subsolution**, i.e. the answer is picked out
+by *maximising* `T` subject to a one-sided constraint, not by driving a two-sided residual to zero.
+
+That is exactly the missing mechanism. Under `(q−1)²` a shadow that is too low is barely penalised —
+the gradient is right, only the constant is wrong. Under the variational form it is penalised
+directly, because the objective pushes `T` up until the constraint binds, and the constraint is what
+propagates the detour cost inward. Concretely:
+
+    minimise   −mean(T)  +  λ · mean(relu(‖∇T‖_g / s − 1)²)
+
+one-sided (only *super*-unit gradients are penalised), and non-local in effect despite being computed
+pointwise, since the maximisation couples every point through the constraint. Untested; this is the
+next thing to run, ahead of viscosity.
+
+### The variational reformulation diverges as written
+
+`minimise −mean(T) + λ·mean(relu(q−1)²)`, torus, one obstacle, clamp + compact 3σ, 4000 steps.
+λ = 30: **RMS 16.05**, objective −12.4 (negative — the ascent term dominated).
+
+The characterisation is correct but the *penalised* form is not equivalent to it. Two defects:
+
+1. `−mean(T)` is unbounded below, so the ascent term always has somewhere to go.
+2. The constraint is a **mean** of squared violations over 2048 sampled points, so a small region can
+   violate badly while the average stays small. The maximal-subsolution theorem needs
+   `‖∇u‖ <= s` **everywhere along every path**; a sampled mean does not deliver that. A max-norm
+   penalty, an augmented-Lagrangian schedule on λ, or a hard barrier would be the honest
+   implementations. Higher λ (100, 300) is running but only shifts the balance point — at the
+   equilibrium `k ≈ 1 + c/(2λ)` the inflation shrinks like 1/λ without ever being bounded.
+
+Recorded as a **negative result for this implementation**, not for the idea.
+
+### Weak supervision: 30 sparse shadow-targeted anchors
+
+Decision (user's): stop pushing purely label-free formulations on the torus and add sparse
+supervision. The 30-point budget is not arbitrary — it is this repo's own measured result from before
+the rewrite (entries W1/W2/U): 30 **shadow-targeted** RRT* anchors took the 3-obstacle torus from
+0.307 to **0.177**, while 30 **uniform** anchors reached only 0.229 at the same budget, and weight
+**0.5 beat 1.0**. The last point matters: RRT* costs are *upper bounds* (its paths are suboptimal), so
+trusting them hard bakes that suboptimality into the field — the B4 lesson, where hard anchors scored
+worse than no supervision at all.
+
+Note this is **not** the existing `weak_supervision.py`, which uses ~300 roadmap nodes as a *dense
+base* (`T = roadmap_base·exp(g)`, historical B5 = 0.109) and which this log already flags as
+effectively cheating, since a dense base is exactly what high dimensions cannot supply. Anchors keep
+`T = base·exp(g)` and add `anchor_weight · mean((T(x_i) − c_i)²)` at 30 points. Anchor costs come from
+`sampling.build_roadmap`, computed from the known slowness field — self-supervised, never from fast
+marching. Selection is biased toward nodes whose straight ray from the source is occluded
+(`anchor_shadow_pref`), and a uniform-anchor control is run alongside so the placement effect is
+measured rather than assumed.
+
+### Hyperbolic: the success criterion, agreed BEFORE the run
+
+H² is predicted to be the hardest manifold, and a correct result will still look bad in absolute
+terms, so the criterion is fixed in advance. Measured scene properties at one obstacle: `do nothing`
+0.653 (vs torus 0.320), median detour 1.060 (vs 1.015), max detour 3.55 (vs 2.14), ground truth's own
+discretisation error 0.051 (vs 0.028). Geodesics diverge exponentially at K=−1, so shadows are both
+larger and deeper — that is physics, not a defect.
+
+- **Working:** improvement over `do nothing` comparable to the torus's ~1.7x, i.e. RMS around 0.38 or
+  better, with error concentrated in the shadow.
+- **Broken:** NaNs, no improvement over 0.653, or error concentrated *outside* the shadow.
+
+An absolute RMS near the torus's 0.19 is **not** the bar and should not be read as one.
+
+### Experiment 2 clears the target on the torus — after fixing a ported-recipe error
+
+**RMS 0.0735 with 30 sparse anchors**, one obstacle, torus, seed 1, res 240. Against `do nothing`
+0.3197 that is 4.4x, and it is below the 0.1 target.
+
+| arm | RMS | max | MAE | MAE shadow |
+|---|---|---|---|---|
+| label-free best (clamp + compact 2σ) | 0.1844 | 1.269 | 0.0935 | 0.5383 |
+| + 30 anchors, `rrt_iters=350` | 0.3393 | 1.074 | 0.2089 | 0.2168 |
+| **+ 30 anchors, `rrt_iters=1500`** | **0.0735** | **0.382** | **0.0502** | **0.1077** |
+
+The only difference between the last two rows is the RRT* iteration count. Shadow MAE falls 0.538 →
+0.108, a 5x improvement in the region that blocked every label-free mechanism tried this session.
+
+**The error, stated plainly: the historical recipe was ported without its precondition.** The log's
+own entry (line 570) records that anchors were *validated to ±0.04 against fast marching* before
+being used. That validation was skipped, and the default `rrt_iters=350` does not meet it.
+
+**And "RRT* is inaccurate" was the wrong description** — RMS hid the real shape of the problem:
+
+| iters | p50 | p75 | p90 | p95 | p99 | max | % off by >10% |
+|---|---|---|---|---|---|---|---|
+| 350 | 1.008 | 1.029 | 1.089 | 1.217 | 1.424 | 1.508 | **9.0%** |
+| 1500 | 0.991 | 0.996 | 1.001 | 1.003 | 1.011 | 1.016 | 0.0% |
+
+The median node is within 0.8% even at 350 iterations. The damage is a thin tail — and
+`anchor_shadow_pref=3.0` selects *occluded* nodes, which are exactly the ones a sparse tree routes
+badly, so the selection rule concentrated on that tail. That is why shadow-targeting came out *worse*
+than uniform at 350 iterations, inverting the historical result.
+
+### RRT* verified correct
+
+Checked after the anchor failure, since a broken planner would invalidate everything downstream. All
+properties hold at `rrt_iters=1500`: cost >= 0 with source cost 0; cost >= the free-space geodesic
+(0/300 violations); detours behind the obstacle captured (max 3.41x); accuracy against ground truth
+RMS 0.0287, p99 ratio 1.011.
+
+An intermediate hypothesis — that a fixed 6-sample edge quadrature under-priced hops clipping an
+obstacle — was tested and **falsified**: nothing changed after fixing it. The adaptive quadrature was
+kept anyway, since 6 samples genuinely under-priced 3.1% of step-length edges by more than 1%, but it
+is not credited with any result.
+
+### Hyperbolic H² label-free: passes the pre-registered criterion
+
+**RMS 0.3330** against `do nothing` 0.6527 — a **1.96x** improvement, better in ratio than the torus's
+label-free 1.7x, and inside the criterion fixed before the run (~0.38 or better, error in the shadow).
+The larger absolute error is the predicted physics of K=−1: max detour 3.55 vs the torus's 2.14, since
+geodesics diverge exponentially. The method transfers to negative curvature.
+
+### Experiment 2 status
+
+| manifold | K | do nothing | label-free | + 30 anchors | best improvement |
+|---|---|---|---|---|---|
+| sphere S² | +1 | 0.1256 | **0.0144** | — | 8.7x |
+| torus T² | 0 | 0.3197 | 0.1844 | **0.0735** | **4.4x** |
+| Poincaré H² | −1 | 0.6527 | **0.3330** | not run | 1.96x |
+
+### CORRECTION — "weak supervision does not work on hyperbolic" was wrong
+
+That claim was made off a single failed run and is withdrawn. What was actually shown is narrower:
+**RRT\* equality anchors** fail on H². The record contradicts the general statement —
+`results/manifolds.md` §5 has hyperbolic weak supervision at **1.0112 → 0.5334 (2.6x)**, the *best*
+improvement ratio of the three manifolds in that table.
+
+The two are different mechanisms and were conflated:
+
+| | historical (worked) | what was run (failed) |
+|---|---|---|
+| prior | sphere-packing roadmap + Dijkstra (`build_sphere_roadmap`) | RRT* tree (`build_roadmap`) |
+| how it is used | two-sided bounds `T_lb <= T <= T_ub`, hinge | equality anchors `(T − c)²` |
+| strategy | `hntfields` | anchor term added to `factored` |
+
+Two reasons the sphere packing should suit negative curvature better, both structural:
+
+1. **Node placement adapts to the geometry.** Each node claims a maximal free sphere and candidates
+   inside an existing sphere are rejected, so coverage is by *volume*. Uniform-sample RRT* is exactly
+   what exponential volume growth defeats — measured: on H² the tree was still unconverged at 12,000
+   iterations after 635 s, with anchor RMS 0.6567 against a field of 0.3330, while the torus converged
+   in 21 s to 0.0326.
+2. **Bounds tolerate a suboptimal prior; equalities do not.** A graph shortest path is an upper bound,
+   so a hinge never drags the field toward a wrong value — which is precisely how the equality anchors
+   failed, landing the field at the anchors' own error.
+
+**Standing lesson, now twice: check what a name refers to before porting a result under it.** "Weak
+supervision" named two different mechanisms in this project, and the anchor variant's failure was
+generalised to the label. Measurement of the sphere-packing roadmap's quality on H² is what decides
+this, and it is running.
+
+## Session end state — read this before touching supervision again
+
+**Trustworthy results (label-free; no planner, no roadmap anywhere in the path):**
+
+| scene | manifold | do nothing | label-free RMS | improvement |
+|---|---|---|---|---|
+| no obstacles | torus / sphere / H² / SO(3) | — | 0.0046 / 0.0004 / 0.0013 / 0.0009 | vs the analytic field |
+| 1 obstacle | sphere S² | 0.1256 | **0.0144** | 8.7x |
+| 1 obstacle | torus T² | 0.3197 | **0.1844** | 1.7x |
+| 1 obstacle | Poincaré H² | 0.6527 | **0.3330** | 2.0x |
+| 3 obstacles | torus T² | 0.3158 | **0.1448** | 2.2x |
+
+**Supervised results, and what each one actually ran.** Two different mechanisms were used under the
+same CLI flag at different points in the session, which is the error that produced the confusion
+below — `--num-anchors` meant *RRT\* equality anchors* before `roadmap_bounds` was written and
+*sphere-packing roadmap bounds* after it, with no rename.
+
+| scene | mechanism actually run | nodes | weight | result | vs label-free |
+|---|---|---|---|---|---|
+| torus, 1 obs | RRT* equality anchors | 30 | 0.5 | **0.0735** | better (2.5x) |
+| torus, 1 obs | RRT* equality anchors, under-converged tree | 30 | 0.5 | 0.3393 | worse |
+| Poincaré, 1 obs | RRT* equality anchors, off-manifold nodes | 30 | 0.5 | 1.3467 | far worse |
+| Poincaré, 1 obs | sphere-pack bounds (pre edge-fix) | 300 | 0.5 | 0.2496 | better, but on broken edge pricing |
+| torus, 3 obs | sphere-pack bounds — **mis-configured, retracted** | 30 | 0.5 | ~~0.2012~~ | not a result |
+
+**The 3-obstacle bounds number is retracted, not reported as a comparison.** A 30-node packing at
+weight 0.5 is below the configuration's own validity threshold, so it measures the mis-configuration
+rather than the mechanism. It was also initially attributed to the wrong mechanism entirely: **no
+RRT\* and no equality anchor was in that run.**
+It used a 30-node sphere packing with `lower = 0.9 x graph_time` at weight 0.5. The repo's own
+hntfields note records that the torus packing needs **~460 nodes** at `max_radius 0.3` before its
+graph paths are near-optimal; at 30 nodes the "lower" bound sits *above* truth across much of the
+domain, and at weight 0.5 — fifty times the historical `lambda_R = 1e-2` — an invalid bound dictates
+rather than nudges. The uniformly **red** (over-predicting) error map is that signature exactly.
+
+**The principle, stated correctly.** An RRT\* cost is an upper bound, so consumption must match
+*measured* prior quality:
+
+- **prior error << field error** -> equality anchors are fine and are the strongest tool available.
+  Torus 1-obstacle: prior RMS 0.033 against a field of 0.184, p99 ratio 1.005, so the upward bias is
+  ~0.5% and negligible — hence 0.0735.
+- **prior loose** -> bounds, but only with enough nodes for the corridor to be valid and at
+  `lambda ~ 1e-2` so a wrong bound nudges instead of dictating.
+- **prior per-node noisy** -> a soft-min base `min_i(cost_i + hop)`, where one bad node loses the min
+  to a better neighbour. This is how the historical `weak_supervision`/B5 path consumed RRT\* and it
+  never gave trouble.
+
+**The recurring process error, three instances:** "weak supervision" naming two mechanisms;
+`tau_bias` results ported without their precondition; `--num-anchors` silently changing meaning
+mid-session. In each case a name was reused across a mechanism boundary and outcomes were attributed
+across it. Check what a flag currently *does* before attributing a result to what it used to do.
+
+## 2026-08-20 — RRT* validated, and three defects in how sparse anchors were selected
+
+The question was whether the RRT* prior runs correctly, because the sparse anchors drawn from it are
+not being selected properly. Three separate defects, each measured below, plus a performance finding
+that turned out to be the reason the prior had never actually been validated on the scenes it was
+supervising.
+
+### Defect 1 — the shadow-targeted selection was not in the code at all
+
+`factored.rrt_anchors`, the live equality-anchor path, drew its anchors with a plain uniform
+`rng.choice`. The recipe that produced this project's best supervised result was *shadow-targeted*
+selection, and the repo's own control measures the difference at 1.6x — 30 shadow-targeted anchors
+0.0735 against 30 uniform ones 0.1192, same tree, same weight. The selector that implements it,
+`sampling.rrt_star_anchors_shadow`, existed but **nothing called it**: dead code since the package
+reorganisation. `reproduce_exp2.sh` had a note admitting the row does not reproduce; the cause is
+this.
+
+### Defect 2 — the only shadow selector traced a flat-chart ray, which is wrong off the torus
+
+That dead selector labelled a node occluded by walking `start + f·displacement_np(start, x)`. This
+repo has already fixed that spelling twice elsewhere (`sweep.shadow_mask`, `geodesic_samples_np`) and
+recorded why: it is a chord on the sphere, an overshoot past the chart wall in the Poincaré ball, and
+a 3-vector-plus-4-vector shape error on SO(3). Measured against the geodesic ray
+`Exp_start(f·Log_start(x))` on the converged tree, one obstacle, seed 1 — nodes the two tests label
+differently:
+
+| manifold | disagreements | of nodes |
+|---|---|---|
+| torus T² | 10 | 3001 (0.3%) |
+| sphere S² | 1151 | 12001 (9.6%) |
+| Poincaré H² | **2461** | **3001 (82%)** |
+| SO(3) | `ValueError` | the shape error, not a wrong answer |
+
+On the torus the shortcut is very nearly right, which is exactly why it survived: the manifold the
+recipe was developed on is the one manifold it works on. On H² it mislabels four nodes in five.
+
+### Defect 3 — selection ran after the wrong thinning step
+
+Anchors were drawn from `build_roadmap`'s 300-node subsample rather than from the tree. **The first
+version of this entry claimed the subsample "thins the occluded nodes"; that is wrong and is
+corrected here.** A uniform subsample preserves the occluded *fraction* — 9.1% of the full
+one-obstacle torus tree, 9.0% of a 300-node draw. What it does not preserve is the *count*: 272
+occluded nodes become 27. A 30-anchor budget then comes from a candidate pool barely larger than
+itself, so which points get pinned is decided by the thinning rather than by the preference.
+
+### The performance finding: XLA was recompiling once per iteration
+
+Building the tree was far slower than the sum of its parts — 350 iterations took 43.9 s on the torus
+while the per-iteration primitives sum to ~1.5 ms. The cause is that every geometric primitive routes
+through `env.geodesic`/`log_map`/`exp_map`, which are JAX functions, so each distinct argument
+**shape** triggers an XLA compilation. An RRT* tree grows by one node per iteration, so the
+tree-wide distance query presents a brand-new shape every single iteration. Measured, one
+`geodesic_distance_np` call against the tree:
+
+| shape pattern | per call |
+|---|---|
+| fixed shape, repeated | **0.37 ms** |
+| shape grows by one each call (what RRT* did) | **66.13 ms** (178x) |
+| bucketed to 6 powers of two | 3.81 ms |
+
+Two changes follow. Array shapes are **bucketed to powers of two** (`_bucket`), with the preallocated
+node array prefilled with `start` so padded rows are valid manifold points and every decision masks
+them out; and the slowness integral's sample count is fixed once from `max(step, radius)`, the
+largest hop any RRT* edge can have, instead of being read off each batch. Edge costs are also
+evaluated for the whole neighbour set in one batched call (`edge_times_np`) — worth 26–148x on that
+step alone by microbenchmark — but that was **not** the bottleneck and on its own bought nothing.
+
+| torus, one obstacle | before | after |
+|---|---|---|
+| 350 iterations | 43.9 s | **1.9 s** |
+| 1500 iterations | ~13 min (extrapolated) | **2.2 s** |
+| 3000 iterations | — | **4.0 s** |
+
+This resolves a contradiction in this log: an earlier entry records the torus tree building in 21 s,
+which stopped reproducing after the geodesic-correctness fixes replaced chart arithmetic with JAX
+calls. The correctness fix is what destroyed the speed. Bucketing keeps the correct geometry and
+recovers the speed; nothing reverts.
+
+**Equivalence, checked rather than assumed.** Node positions depend only on the sampler draws, the
+nearest-node argmin and steering, none of which changed, so old and new must agree *bitwise*.
+Measured at 350 iterations: `max|Δposition| = 0.000e+00` on both torus and sphere, and costs within
+2e-3 relative. The cost drift is the sample-count rule — the batch samples every edge at least as
+finely as the per-edge rule did, never less, so it errs toward *over*-pricing, which is the safe
+direction for a quantity that must stay an upper bound.
+
+### The validation table — what the prior is actually worth
+
+One obstacle, seed 1, tree converged by the doubling rule, scored against fast marching at
+resolution 240 (validation only; no training path can reach it). `>10%` is the fraction of nodes more
+than 10% above truth — the tail that broke the torus at 350 iterations, and the tail a shadow-biased
+selector concentrates on.
+
+| manifold | nodes | build | prior RMS | p50 | p90 | p99 | max | >10% | base violations |
+|---|---|---|---|---|---|---|---|---|---|
+| torus T² | 3001 | 7.5 s | 0.0296 | 0.990 | 0.998 | 1.004 | 1.053 | 0.0% | 0 |
+| sphere S² | 12001 | 225.6 s | 0.0078 | 0.999 | 1.004 | 1.014 | 1.147 | 0.1% | 0 |
+| Poincaré H² | 3001 | 47.1 s | 0.0282 | 0.992 | 1.002 | 1.013 | 1.024 | 0.0% | 0 |
+| SO(3) | 12001 | 109.4 s | 0.0393 | 1.005 | 1.022 | 1.044 | 1.323 | 0.1% | **1** |
+
+`base violations` counts nodes whose cost-to-come falls below the free-space geodesic, which no
+feasible path can do when `s >= 1`; it is a self-consistency check needing no ground truth.
+
+**The verdict per manifold, against this repo's own principle (equality anchors need prior error
+<< field error; otherwise bounds):**
+
+- **Torus — equality anchors.** Prior 0.0296 against a label-free field of 0.1844, a 6x margin, p99
+  1.004. This is the regime the historical 0.0735 came from, now confirmed on the exact scene.
+- **Poincaré H² — equality anchors, and this is new.** Prior 0.0282 against a field of 0.3330 is a
+  **12x** margin, the largest of the three. **The earlier claim that RRT\* cannot converge on H² is
+  withdrawn**: that entry recorded the tree still unconverged at 12,000 iterations after 635 s, which
+  was the XLA recompilation cost, not the geometry. The converged H² tree now builds in 47 s and is
+  the second most accurate prior in the table. The historical 1.3467 failure is fully explained by
+  three stacked defects, all now fixed — off-manifold nodes (`in_domain_np`), an unconverged tree
+  (the doubling rule), and flat-ray selection (82% mislabelled).
+- **Sphere — no anchors.** Prior 0.0078 against a label-free field of 0.0144 is only a 1.8x margin,
+  nowhere near the `<<` the principle requires, and the label-free sphere is already the strongest
+  result in the ladder. The "+30 anchors" cell in `results/experiments.md` stays `—` deliberately.
+- **SO(3) — bounds only, not chased.** The tree is still improving at the doubling cap and carries one
+  base violation, so the validator refuses equality anchors on it. SO(3) is not on the 2-D
+  experiment ladder; recorded, out of scope for this session.
+
+### What changed in the code
+
+- `sampling.rrt_star` — batched edge costs, bucketed shapes, preallocated node array. Same algorithm,
+  bit-identical trees.
+- `sampling.converged_tree` — the doubling loop split out of `build_roadmap`, so a sparse selector can
+  draw from the full tree. `build_roadmap`'s signature and behaviour are unchanged, so
+  `weak_supervision.py` and `run.py` are untouched.
+- `sampling.occluded_from_source` — one implementation of the geodesic occlusion ray.
+  `sweep.shadow_mask`, the anchor selector and `validate_prior` all delegate to it.
+- `sampling.shadow_anchors` — clearance filter (nodes must clear an obstacle by 0.05; the historical
+  `weak_clearance` value is unrecoverable, so this is a new choice, made because the slowness ramp is
+  steepest at the boundary and the tree's quadrature is least accurate exactly there), then a
+  shadow-preferential draw. `shadow_pref = 0` *is* the uniform control, not a second code path.
+- `sampling.rrt_star_anchors` / `rrt_star_anchors_shadow` — **deleted**. Both were dead and one
+  carried the flat ray. This project's recurring failure is a stale name ported across a mechanism
+  boundary; leaving a wrong selector lying around invites a fourth instance.
+- `Config.anchor_shadow_pref` (default 3.0), threaded through `SweepConfig` and `sweep._config`.
+- `experiments/validate_prior.py` — new; produces the table above. Run it before supervising with a
+  prior, which is this repo's third standing rule and until now had no tool behind it.
+- `experiments/preflight.py` — a fourth arm covering the equality path, which had no smoke coverage.
+
+**Considered and deliberately not built.** RRT*'s shrinking k-nearest neighbour set and rewiring that
+propagates to descendants are both genuine gaps against the published algorithm. The decision rule
+was fixed before the table was run — if the converged tree showed 0 base violations and p99 < 1.05,
+the algorithm is adequate — and the table meets it on every 2-D manifold. Changing the algorithm
+would move the reproduction target for no measured benefit.
+
+### Experiment 2 label-free reproduces exactly, after the changes
+
+Re-run at the documented settings (res 240, 4000 steps, 2048 collocation, `V >= 0` clamp, compact
+support 2σ, no causal weighting), seed 1:
+
+| manifold | recorded | measured now |
+|---|---|---|
+| torus T² | 0.1844 | **0.1844** |
+| sphere S² | 0.0144 | **0.0144** |
+| Poincaré H² | 0.3330 | **0.3330** |
+
+`preflight` is 12/12 PASS both before and after every change above, with identical per-arm RMS.
+
+### Experiment 2 anchored arms, on the fixed selector
+
+Same recipe as the label-free arms (res 240, 4000 steps, 2048 collocation, `V >= 0`, compact support
+2σ, no causal weighting), plus 30 equality anchors at weight **0.5** — not the `1e-2` default, which
+belongs to the *bounds* mechanism. Seed 1, one obstacle.
+
+| arm | shadow anchors | RMS | shadow MAE | vs label-free |
+|---|---|---|---|---|
+| torus — label-free | — | 0.1844 | 0.5383 | — |
+| torus — 30 **shadow-targeted** anchors | 6 / 30 | **0.0856** | **0.1209** | **2.2x** |
+| torus — 30 **uniform** anchors (control) | 1 / 30 | 0.1446 | 0.4118 | 1.3x |
+| Poincaré H² — label-free | — | 0.3330 | 1.1307 | — |
+| Poincaré H² — 30 **shadow-targeted** anchors | 8 / 30 | **0.0502** | **0.1221** | **6.6x** |
+
+**The placement effect reproduces, and it is the whole mechanism.** Shadow-targeted 0.0856 against
+uniform 0.1446 at identical tree, budget and weight — 1.7x, matching the historical 1.6x (0.0735 vs
+0.1192). The anchor counts show why: the preference puts 6 of 30 anchors in shadow against the
+control's 1. The remaining gap to the historical 0.0735 is expected and was not chased — tree costs
+moved by up to 2e-3 under the batched quadrature and the selection RNG is a different draw, so the
+pre-registered bar was the 0.07–0.12 band with a measurably worse control, and both hold.
+
+**Hyperbolic equality anchors are a new arm, and the strongest supervised result in the project.**
+0.3330 -> **0.0502**, a 6.6x improvement over label-free and 13x over `do nothing` (0.6527), with
+shadow MAE falling 1.1307 -> 0.1221. The log previously recorded H² weak supervision as a failure at
+1.3467. That is now fully explained: off-manifold tree nodes (fixed by `in_domain_np`), an
+unconverged tree (fixed by the doubling rule, which was unaffordable until the XLA shape fix), and a
+flat-chart occlusion ray that mislabelled **82%** of H² nodes. All three are fixed and the mechanism
+works better on H² than anywhere else — which is what the prior-quality table predicted, H² having
+the largest prior-to-field margin (0.0282 against 0.3330, 12x).
+
+**This is *equality anchors*, not the sphere-packing *bounds* mechanism.** The two have been
+conflated twice in this log; they share neither prior nor loss term. Nothing here revises the bounds
+results.
+
+### Experiment 3 — three obstacles, label-free
+
+No planner, no roadmap, no anchors anywhere in the training path. Same recipe as the Exp 2 label-free
+arms, resolution 240, seed 1.
+
+| manifold | do nothing | label-free RMS | shadow MAE / overall MAE |
+|---|---|---|---|
+| torus T² | (see note) | **0.2621** | 3.52x |
+
+**Note on 0.1448.** The session-end table records a 3-obstacle torus label-free result of 0.1448.
+That number appears exactly once in this log, in a summary table, with **no run entry, no flag set
+and no figure** behind it; the fair-baseline suite on the same nominal scene puts label-free methods
+at 0.307–0.534, which the 0.1448 does not sit with either. The 0.2621 here is measured at a recorded
+recipe that reproduces all three Exp 2 label-free numbers to four decimals. Treat 0.1448 as
+unsourced until someone reproduces it, and prefer the recorded run.
+
+To stop this recurring, `sweep` now prints a **`nothing`** column — the RMS of `T = base`, i.e. of
+learning nothing — for every seed of every run, and the verdict line quotes the improvement ratio.
+Every comparison in the write-up is a ratio against that baseline, so the baseline should never again
+be something a reader has to go looking for.
+
+### Path extraction: the failure mode is occlusion, not proximity — and RMS does not predict it
+
+The 3-obstacle torus field, 10 goals spread across free space, reached **10/10** collision-free. That
+result is real but it is a weak test, and the goal-mix line now printed with every run says why: **0
+of those 10 goals were behind an obstacle.** Splitting goals into three classes on the same field:
+
+| goal class | n | success | how the failures fail |
+|---|---|---|---|
+| spread across open free space | 10 | **10/10** | — |
+| hugging an obstacle boundary (clearance < 0.35) | 20 | **20/20** | — |
+| **behind an obstacle (source ray blocked)** | 20 | **10/20** | 10 × `diverged` |
+| mixed, a third of each | 60 | 50/60 | every failure was a shadow goal |
+
+**Not one collision in any arm.** Every failure is the same mode: the descent runs to the 4000-step
+cap (path length exactly 80.0 = cap × step) with the endpoint still ~2.8–3.0 from the source, and the
+trapped endpoints *cluster* — several goals stop at 2.960, several at 2.772. A handful of spurious
+basins capture many trajectories; this is not scattered noise.
+
+That is the predicted consequence of the objective. The pointwise residual constrains `‖∇T‖` and not
+the *level* of `T`, and behind an obstacle the level is a path integral it cannot see. A field whose
+shadow level is wrong by a slowly-varying amount has a near-zero residual and a gradient that
+circulates rather than descends. Boundary-hugging goals succeeding 20/20 is the informative negative:
+**proximity to an obstacle is not what breaks descent — occlusion is.**
+
+### The anchors improve RMS and make planning *worse*
+
+Testing whether the supervision that fixes the shadow level also fixes path extraction. Same scene
+(torus, one obstacle, seed 1), same 20 shadow goals, only the field differing:
+
+| field | RMS | shadow-goal success |
+|---|---|---|
+| label-free | 0.1844 | **18/20** |
+| + 30 shadow-targeted equality anchors | **0.0856** | 14/20 |
+
+**The more accurate field plans worse**, and the reason is visible in the fields themselves. Counting
+grid cells strictly below all eight neighbours — spurious basins a descent can be trapped in, with
+the fast-marching field's own count as the control on the identical grid:
+
+| torus field | RMS | minima | GT minima | spurious | shadow-goal success |
+|---|---|---|---|---|---|
+| 1 obstacle, label-free | 0.1844 | 2 | 1 | **1** | **18/20** |
+| 1 obstacle, + 30 anchors | **0.0856** | 3 | 1 | 2 | 14/20 |
+| 1 obstacle, + 30 uniform anchors | 0.1446 | 7 | 1 | 6 | — |
+| 3 obstacles, label-free | 0.2621 | 4 | 1 | 3 | 10/20 |
+
+**Planning success tracks the spurious-minimum count; it does not track RMS, and the two rank in
+opposite orders.** By RMS the anchored field is best (0.0856 < 0.1446 < 0.1844); by spurious minima
+it is the label-free field (1 < 2 < 6). The mechanism is straightforward: an equality anchor pins `T`
+at an isolated point, so the mixture must hit that value locally, and between anchors it overshoots —
+buying value accuracy and paying in dimples. The uniform-anchor arm, whose anchors are scattered
+rather than concentrated in the shadow, is the worst of the three at 6 spurious minima, which is the
+same effect at its least targeted.
+
+**What this means for the claim.** RMS against fast marching measures whether the field *is* the value
+function. It does not measure whether the field is *usable*, and this repo has been reporting only the
+first. A value function's job is that `-∇T` reaches the source; the honest metric pair is
+(RMS, spurious minima), or better, the shadow-goal success rate directly. Recorded, not chased — the
+obvious levers (a monotonicity penalty along sampled rays, or consuming the prior as a soft-min base
+rather than as equalities, which is how `weak_supervision`/B5 consumed it without trouble) are
+untested.
+
+Caveat on the minima count: it is a grid diagnostic, so it inherits the grid. The sphere's lat-long
+chart reports 41 minima in the *ground truth* itself, from the pole rings; the count is only
+meaningful read against the ground truth's own count on the same grid, which is how the table above
+is written.
+
+### Experiment 1 is now exact, on all four manifolds
+
+| manifold | init RMS | RMS | previously recorded |
+|---|---|---|---|
+| torus T² | 0.0638 | **0.0000** | 0.0046 |
+| sphere S² | 0.1394 | **0.0000** | 0.0004 |
+| Poincaré H² | 0.0296 | **0.0000** | 0.0013 |
+| SO(3) | 0.0219 | **0.0000** | 0.0009 |
+
+The `V >= 0` projection is what closes the last three decimal places. With no obstacles the residual
+is minimised at `g = 0`, and projecting the weights onto `V >= 0` after each step drives them to
+*exactly* zero rather than to a small residual value, so `T = base` is attained rather than
+approached. The previously recorded values predate that clamp being part of the standard arm.
+
+The verdict line no longer prints an improvement ratio here: with no obstacles `do nothing` is 0, so
+the ratio is undefined rather than infinite, and "0.00x improvement" would have read as a
+catastrophic result.
+
+### Planning, with the optimal path as the reference arm
+
+Rewritten after the first version was rightly called out as a weak test. Two changes:
+
+1. **Every goal is planned twice** — once by descending the learned field, once by descending the
+   fast-marching field on its own grid (8-neighbour steepest descent, no interpolation). The second
+   is the optimal route. It reaches **60/60 on every scene here**, which is the number that makes the
+   learned result readable: every learned failure belongs to the learned field, not to the grid.
+   Drawing our paths over the ground-truth panel, as the first version did, put our failures on a
+   panel that had nothing to do with them.
+2. **One goal set, and its mix is always printed.** 60 goals spread over the manifold with half
+   biased onto obstacle boundaries; occlusion is left at the scene's natural rate rather than forced,
+   and reported. The earlier 10/10 was on a draw that contained **zero** occluded goals, because the
+   sampler excluded them by construction — the rate was real and meaningless.
+
+3-obstacle torus, 60 goals, per class:
+
+| class | goals | optimal | learned |
+|---|---|---|---|
+| behind an obstacle | 12 | 12/12 | **10/12** |
+| hugging a boundary | 21 | 21/21 | 21/21 |
+| open free space | 27 | 27/27 | 27/27 |
+| **all** | 60 | **60/60** | **58/60** |
+
+Query cost: **0.02 s** to load the trained field, **5.11 s** to plan all 60 paths (85 ms/goal,
+including JIT warm-up). That asymmetry against a minutes-long one-off fit is the claim the experiment
+exists to make, and it only holds because `plan` loads parameters — the previous version retrained,
+which would have hidden it.
+
+**No collisions on any field in any arm.** Every failure is a shadow goal and every failure has the
+same shape: the descent runs to the step cap with the endpoint far from the source. Boundary-hugging
+goals at 21/21 is the control that makes this specific — proximity to an obstacle is not what breaks
+descent, occlusion is, which is exactly where the pointwise residual leaves the level free.
+
+The RMS-vs-usability inversion holds on this goal set too. Same 60 goals, one obstacle:
+
+| torus field | RMS | spurious minima | goals reached | shadow goals |
+|---|---|---|---|---|
+| label-free | 0.1844 | **1** | **55/60** | **14/19** |
+| + 30 shadow-targeted anchors | **0.0856** | 2 | 51/60 | 10/19 |
+| + 30 uniform anchors | 0.1446 | 6 | — | — |
+
+`srms/experiments/minima.py` computes that column from the saved fields, so it is reproducible
+without retraining and `./run_experiments.sh plan` ends by printing it.

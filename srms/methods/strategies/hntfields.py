@@ -230,7 +230,7 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
         params, opt_state, loss, aux = step(params, opt_state, thetas, upper, lower)
         # The model picks its own size by marginal value (training_aids.DensifyController).
         densifier.record(loss)
-        if densifier.should_densify(i, len(params[0])):
+        if densifier.should_densify(i, backend.num_units(params)):
             params, opt_state, k = backend.adapt(params, opt_state, spawn_residual, env, cfg, rng)
             if k is not None:
                 progress.write(f"[hntfields] step {i}: densify → {k} splats ({backend.num_params(params)} params)")
@@ -244,6 +244,6 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
                 )
         if checkpoint is not None and i > 0 and i % cfg.checkpoint_every == 0:
             checkpoint(params, i)
-    print(f"[hntfields] {densifier.summary(len(params[0]) if isinstance(params, tuple) else 0)}", flush=True)
+    print(f"[hntfields] {densifier.summary(backend.num_units(params))}", flush=True)
     print(f"[hntfields] final model: {backend.num_params(params)} trainable parameters", flush=True)
     return params

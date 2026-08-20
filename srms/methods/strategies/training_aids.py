@@ -26,16 +26,33 @@ def causal_rate(cfg, step: int) -> float:
     return rate
 
 
-def causal_loss(env, colloc: jnp.ndarray, squared_residual: jnp.ndarray, rate: jnp.ndarray) -> jnp.ndarray:
+def causal_loss(env, colloc: jnp.ndarray, squared_residual: jnp.ndarray, rate: jnp.ndarray, order_by=None) -> jnp.ndarray:
     """Causal-weighted mean of a per-point squared residual.
 
-    Orders points source-outward by geodesic distance from ``env.start``, then weights each by
-    ``exp(-rate · upstream)`` where ``upstream`` is the cumulative (stop-gradient) residual mass of
-    all nearer points in that ordering — so a far point's loss is discounted until nearer points are
-    already well-fit.
+    Orders points source-outward, then weights each by ``exp(-rate · upstream)`` where ``upstream`` is
+    the cumulative (stop-gradient) residual mass of all earlier points — so a far point's loss is
+    discounted until the ones it causally depends on are already fit.
+
+    Args:
+        env: Environment supplying ``geodesic`` and ``start``.
+        colloc: Collocation points, [n, dim].
+        squared_residual: Per-point squared residual, [n].
+        rate: Decay rate; 0 disables the weighting.
+        order_by: Per-point arrival time to order by, [n]. Defaults to the free-space geodesic.
+
+    Returns:
+        Scalar weighted mean.
+
+    The ordering key is the whole mechanism, and the free-space default is **wrong wherever obstacles
+    exist**: a point directly behind an obstacle is *near* in free-space distance but *late* in
+    arrival time, so it gets un-muted long before the wavefront has actually reached it — inverting
+    the curriculum exactly where it is meant to help. Measured: causal weighting on the free-space key
+    made the one-obstacle torus *worse* (0.2737 with, 0.2610 without). Passing the model's own
+    predicted ``T`` restores the intended order, and is self-supervised — it is the field being
+    learned, not ground truth.
     """
-    dist = env.geodesic(colloc, jnp.asarray(env.start, dtype=jnp.float32))
-    order = jnp.argsort(dist)
+    key = env.geodesic(colloc, jnp.asarray(env.start, dtype=jnp.float32)) if order_by is None else order_by
+    order = jnp.argsort(jax.lax.stop_gradient(key))
     ordered = squared_residual[order]
     upstream = jnp.cumsum(ordered) - ordered
     weight = jax.lax.stop_gradient(jnp.exp(-rate * upstream))
@@ -125,6 +142,8 @@ class DensifyController:
 
     def summary(self, num_splats: int) -> str:
         """One line: the size the model settled on, and what stopped it growing."""
+        if not self.enabled:
+            return f"fixed structure, {num_splats} splats — densification disabled"
         why = self.stop_reason or "training ended while still growing (raise steps or max_splats)"
         gain = f", last marginal value {self.last_gain:.2e}/splat" if self.last_gain is not None else ""
         return f"chose {num_splats} splats — densification stopped at step {self.stop_step}: {why}{gain}"

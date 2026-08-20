@@ -1,0 +1,29 @@
+\begin{table}[t]
+  \centering
+  \begin{tabular}{llrrr}
+    \toprule
+    Manifold & Curvature $K$ & Splats & RMS error & Max error \\
+    \midrule
+    Torus $T^2$ & $0$ & 1947 & 0.2425 & 1.1743 \\
+    Sphere $S^2$ & $+1$ & 832 & 0.0545 & 0.5152 \\
+    Hyperbolic $H^2$ & $-1$ & 1994 & 1.0112 & 4.1984 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Self-supervised Eikonal time-to-go on three 2-D Riemannian manifolds, \textbf{no weak supervision} (\texttt{ntfields}). PDE residual only; no planner, no roadmap, no ground truth. Identical configuration across all six runs: SRM backend, 4000 steps, 2048 collocation points per step, learning rate 0.003, 3 obstacles, seed 1, scored on a fast-marching grid at resolution 240. $K$ is the constant sectional curvature. Splat count is chosen by the model, not set: capacity grows where the residual is and stops when a densify pass buys less than 1e-05 fractional residual reduction per splat added.}
+  \label{tab:2d-final}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \begin{tabular}{llrrr}
+    \toprule
+    Manifold & Curvature $K$ & Splats & RMS error & Max error \\
+    \midrule
+    Torus $T^2$ & $0$ & 1463 & 0.0417 & 0.5955 \\
+    Sphere $S^2$ & $+1$ & 632 & 0.2169 & 0.7772 \\
+    Hyperbolic $H^2$ & $-1$ & 512 & 0.5334 & 3.1470 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Self-supervised Eikonal time-to-go on three 2-D Riemannian manifolds, \textbf{weak supervision} (\texttt{hntfields}). PDE residual plus sparse-roadmap travel-time bounds; still no ground truth. Identical configuration across all six runs: SRM backend, 4000 steps, 2048 collocation points per step, learning rate 0.003, 3 obstacles, seed 1, scored on a fast-marching grid at resolution 240. $K$ is the constant sectional curvature. Splat count is chosen by the model, not set: capacity grows where the residual is and stops when a densify pass buys less than 1e-05 fractional residual reduction per splat added.}
+  \label{tab:2d-weak}
+\end{table}

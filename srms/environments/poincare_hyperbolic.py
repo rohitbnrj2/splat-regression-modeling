@@ -55,6 +55,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from srms.environments.base import smooth_slowness, union_sdf, unit_geodesic_gradient
+
 Obstacle = tuple[float, ...]  # (*centre[dim] chart coords, hyperbolic radius)
 
 _OBSTACLE_SEED_OFFSET = 5
@@ -158,7 +160,7 @@ class PoincareHyperbolicEnvironment:
         self.tangent_dim = self.dim
         # Chart extent, not a period: only mlp.py reads it, and a ball has nothing periodic to encode.
         self.domain: tuple[float, float] = (-self.trunc_radius, self.trunc_radius)
-        self.axis_labels: tuple[str, str] = ("x₁ (Poincaré chart)", "x₂ (Poincaré chart)")
+        self.axis_labels: tuple[str, str] = ("$x_1$ (Poincaré chart)", "$x_2$ (Poincaré chart)")
         self.render_extent: tuple[float, float, float, float] = (
             -self.trunc_radius,
             self.trunc_radius,
@@ -264,6 +266,10 @@ class PoincareHyperbolicEnvironment:
 
     # ---- obstacle / slowness field -----------------------------------------
 
+    def grad_geodesic(self, x: jnp.ndarray) -> jnp.ndarray:
+        """``∇base`` at x — closed form, so ``base`` is never differentiated (see base.py)."""
+        return unit_geodesic_gradient(self, x)
+
     def _rim_sdf(self, x: jnp.ndarray) -> jnp.ndarray:
         """Hard in/out indicator for the truncation ball — **not** a smooth wall.
 
@@ -288,11 +294,16 @@ class PoincareHyperbolicEnvironment:
         """Signed hyperbolic distance to the union of obstacle balls *and the truncation wall*."""
         per = [distance(jnp.asarray(obs[:-1]), x) - obs[-1] for obs in self.obstacles]
         per.append(self._rim_sdf(x))
-        return jnp.min(jnp.stack(per, axis=0), axis=0)
+        return union_sdf(per, x.shape[0])
 
     def slowness(self, x: jnp.ndarray) -> jnp.ndarray:
         """Smooth slowness: ~1 in free space, rising to slowness_max inside obstacles / past the wall."""
-        return 1.0 + (self.slowness_max - 1.0) * jax.nn.sigmoid(-self.sdf(x) / self.slow_width)
+        return smooth_slowness(self.sdf(x), self.slowness_max, self.slow_width)
+
+    def in_domain_np(self, points: np.ndarray) -> np.ndarray:
+        """True inside the truncation ball. The chart box's corners are not on the manifold."""
+        points = np.asarray(points, dtype=float)
+        return _distance_np(np.zeros(self.dim), points) <= self.wall_distance
 
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy signed distance (host-side, for RRT*'s hot loop)."""
@@ -300,11 +311,11 @@ class PoincareHyperbolicEnvironment:
         per = [_distance_np(np.array(obs[:-1]), points) - obs[-1] for obs in self.obstacles]
         inside = _distance_np(np.zeros(self.dim), points) <= self.wall_distance
         per.append(np.where(inside, 1e3, -1e3))  # domain mask, not a wall — see _rim_sdf
-        return np.min(per, axis=0)
+        return union_sdf(per, len(points), np)
 
     def slowness_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy smooth slowness (host-side, for RRT*'s hot loop)."""
-        return 1.0 + (self.slowness_max - 1.0) / (1.0 + np.exp(self.sdf_np(points) / self.slow_width))
+        return smooth_slowness(self.sdf_np(points), self.slowness_max, self.slow_width, np)
 
     # ---- sampling / ground truth --------------------------------------------
 

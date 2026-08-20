@@ -52,6 +52,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from srms.environments import marching
+from srms.environments.base import smooth_slowness, union_sdf
 
 Obstacle = tuple[float, ...]  # (*centre quaternion[4], angular radius in radians)
 
@@ -142,7 +143,7 @@ class SO3Environment:
         self.dim = 4  # storage: unit quaternion
         self.tangent_dim = 3  # the manifold's true dimension — this is what the splat sees
         self.domain: tuple[float, float] = (-1.0, 1.0)  # storage range; SO(3) has no chart box
-        self.axis_labels: tuple[str, str] = ("Gibbs g₁", "Gibbs g₂")
+        self.axis_labels: tuple[str, str] = ("Gibbs $g_1$", "Gibbs $g_2$")
         self.render_extent: tuple[float, float, float, float] = (-1.0, 1.0, -1.0, 1.0)
         self.has_dense_gt = True  # 3-D polar fast march is tractable (~res^3 cells)
         self.obstacles: tuple[Obstacle, ...] = self._sample_obstacles()
@@ -238,23 +239,37 @@ class SO3Environment:
         dot = jnp.abs(jnp.sum(x * start, axis=-1))
         return 2.0 * jnp.arccos(jnp.clip(dot, 0.0, 1.0 - 1e-7))
 
+    def grad_geodesic(self, q: jnp.ndarray) -> jnp.ndarray:
+        """``∇base`` at q, in quaternion coordinates.
+
+        SO(3) cannot use ``base.unit_geodesic_gradient``: its ``log_map_ambient`` returns the
+        3-component Lie-algebra element while ``metric_inv`` is a 4x4 form on quaternion gradients.
+        Autodiff is safe here, unlike on the sphere — ``base = 2·arccos(|<q, start>|)`` has its
+        singularity at ``<q, start> = 1``, i.e. *at the source*, which collocation already excludes,
+        and the argument is clipped there anyway. At the cut locus (``<q, start> = 0``) the derivative
+        is exactly -2, bounded. ``test_manifolds`` checks the result against the unit-norm identity.
+        """
+        start = jnp.asarray(self.start, dtype=q.dtype)
+        return jax.grad(lambda y: self.geodesic(y, start))(q)
+
     # ---- obstacle / slowness field -----------------------------------------
 
     def sdf(self, q: jnp.ndarray) -> jnp.ndarray:
         """Signed geodesic distance to the union of obstacle balls. SO(3) is compact — no truncation."""
         per = [self.geodesic(q, jnp.asarray(obs[:-1])) - obs[-1] for obs in self.obstacles]
-        return jnp.min(jnp.stack(per, axis=0), axis=0)
+        return union_sdf(per, q.shape[0])
 
     def slowness(self, q: jnp.ndarray) -> jnp.ndarray:
         """Smooth slowness: ~1 in free space, rising to slowness_max inside obstacles."""
-        return 1.0 + (self.slowness_max - 1.0) * jax.nn.sigmoid(-self.sdf(q) / self.slow_width)
+        return smooth_slowness(self.sdf(q), self.slowness_max, self.slow_width)
 
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         points = np.asarray(points, dtype=float)
-        return np.min([_distance_np(np.array(o[:-1]), points) - o[-1] for o in self.obstacles], axis=0)
+        per = [_distance_np(np.array(o[:-1]), points) - o[-1] for o in self.obstacles]
+        return union_sdf(per, len(points), np)
 
     def slowness_np(self, points: np.ndarray) -> np.ndarray:
-        return 1.0 + (self.slowness_max - 1.0) / (1.0 + np.exp(self.sdf_np(points) / self.slow_width))
+        return smooth_slowness(self.sdf_np(points), self.slowness_max, self.slow_width, np)
 
     # ---- sampling / ground truth --------------------------------------------
 

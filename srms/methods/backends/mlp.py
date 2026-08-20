@@ -58,7 +58,7 @@ def init_params(key: jax.Array, env, cfg, p: int = 1) -> MLPParams:
     return layers
 
 
-def eval_raw(params: MLPParams, X: jnp.ndarray, env) -> jnp.ndarray:
+def eval_raw(params: MLPParams, X: jnp.ndarray, env, cfg=None) -> jnp.ndarray:
     """Evaluate the SIREN MLP at each row of X (raw coordinates on env's chart). Returns [n, p]."""
     h = _fourier_features(X, env)
     *hidden, (W_out, b_out) = params
@@ -82,6 +82,17 @@ def adapt(params: MLPParams, opt_state, residual_fn, env, cfg, rng):
     error is'. Returns the model unchanged, so a densifying run is well-defined for either backend.
     """
     return params, opt_state, None
+
+
+def weight_l1(params: MLPParams) -> jnp.ndarray:
+    """Mean |W| over all layers. Not the same object as the splat backend's — an MLP has no per-unit
+    weight whose zeroing removes a localized contribution — so it is a plain weight decay here."""
+    return jnp.mean(jnp.stack([jnp.mean(jnp.abs(W)) for W, _ in params]))
+
+
+def num_units(params: MLPParams) -> int:
+    """0: an MLP has no adaptive unit, so the densify bookkeeping has nothing to count."""
+    return 0
 
 
 def num_params(params: MLPParams) -> int:

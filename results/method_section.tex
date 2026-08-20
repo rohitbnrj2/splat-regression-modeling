@@ -1,0 +1,67 @@
+% ============================================================================
+% Method + Implementation Details -- drop-in replacement for \section{Method}
+% Requires: \usepackage{amsmath}  (currently commented out in the preamble)
+% New bib key used: zhou2019continuity  (Zhou et al., CVPR 2019)
+% ============================================================================
+
+\section{Method}
+
+Let $(\mathcal{M}, g)$ be a Riemannian manifold: a smooth manifold $\mathcal{M}$ equipped with a Riemannian metric $g$ --- a smooth, symmetric, positive-definite tensor field assigning an inner product to each tangent space $T_p\mathcal{M}$. Given a field to be learned on $\mathcal{M}$, we show that \acp{SRM} learn it intrinsically, with no coordinate projection and no input encoding. Each splat is replaced by a wrapped Gaussian: placed in the tangent space at its centre, where it is an ordinary Euclidean density, and pushed onto the manifold by the exponential map. We develop the two constructions in turn and obtain \acp{RSRM} as their union.
+
+\subsection{Splat Regression Models}
+
+An \ac{SRM} \cite{daniels2026splat} represents a function as a weighted superposition of \emph{splats}, each an affine image of a single mother density $\rho$:
+\begin{equation}
+    f(x) = \sum_{i=1}^{k} v_i \, \rho\!\left(A_i^{-1}(x - b_i)\right) \left| \det A_i^{-1} \right|,
+    \label{eq:srm}
+\end{equation}
+Splat $i$ is $\rho$ translated to a centre $b_i \in \mathbb{R}^d$, reshaped by an unconstrained linear map $A_i \in \mathbb{R}^{d \times d}$ so that it is anisotropic and arbitrarily oriented, normalised by $|\det A_i^{-1}|$, and scaled by a weight $v_i \in \mathbb{R}^p$. We take $\rho$ to be the standard Gaussian, for which $A_i$ is a square root of the covariance $\Sigma_i = A_i A_i^\top$. 3D Gaussian splatting \cite{kerbl2023gaussiansplatting} is the special case $d=3$, $A_i = R_i S_i$, read out through the volume rendering integral; the \ac{SRM} leaves dimension, mother density, transform, and readout free. Two properties matter here: each parameter affects $f$ only near its own centre, so capacity can be placed where the approximation error is, and $\nabla f$ is closed-form, which both the Eikonal residual and the readout of optimal paths require.
+
+\subsection{Wrapped Gaussian Distributions}
+
+Equation \eqref{eq:srm} is undefined on a curved space, since $x - b_i$ is not a manifold operation. The standard Gaussian on $\mathcal{M}$ is instead the wrapped, or pushforward, density \cite{ManifoldBook-Ch4}: the Gaussian is placed in the tangent space $T_b\mathcal{M}$, where it is an ordinary vector space, and pushed onto $\mathcal{M}$ along geodesics by $\psi = \mathrm{Exp}_b$. Writing $\psi^{-1} = \mathrm{Log}_b$,
+\begin{equation}
+    \mathcal{N}_w(x; b, A) = \rho\!\left(A^{-1}\mathrm{Log}_b(x)\right) \left| \det A^{-1} \right| J_b(x),
+    \label{eq:wrapped}
+\end{equation}
+with $J_b(x) = \left| \det \partial \mathrm{Log}_b / \partial x \right|$ correcting for the curvature of $\mathcal{M}$. Constructing the density on a new manifold thus requires only the diffeomorphism, its inverse, and its Jacobian.
+
+Two properties make \eqref{eq:wrapped} the appropriate object for a time field rather than merely a valid density. By Gauss's lemma $\mathrm{Exp}_b$ is a radial isometry, so $\|\mathrm{Log}_b(x)\| = d_\mathcal{M}(b,x)$: Euclidean distance in the tangent chart is geodesic distance on the manifold, and each splat is a smooth, anisotropic geodesic-distance chart centred at $b$. A soft minimum of such charts is precisely the form an optimal time-to-go function takes. Second, $J_b$ is the reciprocal of the Jacobi field volume element of $\mathrm{Exp}_b$, which at constant sectional curvature $K$ reduces to one closed form evaluated at $K$. Geodesics converge on the sphere and diverge in hyperbolic space; substituting $\sin \rightarrow \mathrm{id} \rightarrow \sinh$ is the entire difference (Table \ref{tab:geometry}).
+
+\subsection{Riemannian Splat Regression Models}
+
+An \ac{RSRM} replaces each splat of \eqref{eq:srm} with a wrapped Gaussian \eqref{eq:wrapped},
+\begin{equation}
+    f(x) = \sum_{i=1}^{k} v_i \, \mathcal{N}_w(x; b_i, A_i), \qquad x \in \mathcal{M},
+    \label{eq:rsrm}
+\end{equation}
+making the model manifold-general by construction. Exactly three manifold-specific functions appear anywhere in the formulation: $\mathrm{Log}_b$ and $J_b$ in the density, and the inverse metric $g^{-1}$ in the loss. Each is a textbook object with a closed form (Table \ref{tab:geometry}), and our implementation of \eqref{eq:rsrm} is identical across every manifold we report. Note $A_i$ is square at the \emph{intrinsic} dimension of $\mathcal{M}$ however a point is stored: a splat on $SO(3)$ is a $3\times3$ Gaussian in $\mathfrak{so}(3)$ although the point is a unit quaternion. Nothing is embedded, padded, or encoded, and the model contains no trigonometric input transform.
+
+We use \eqref{eq:rsrm} to learn the arrival time field $T$ from a fixed source $x_s$, the viscosity solution of $\|\nabla T\|_g = s$ with $T(x_s)=0$, where slowness $s \geq 1$ is cost per unit length and the time-optimal path is steepest descent on $T$. Following NTFields \cite{ni2023ntfields} we factor $T = d_\mathcal{M}(x,x_s)/\tau$ with $\tau = \sigma(f(x)+\beta) \in (0,1)$, so the source condition holds identically and $T \geq d_\mathcal{M}$ by construction; as $s \geq 1$, the free-space geodesic lower-bounds arrival time, so this parameterises exactly the admissible range. The metric enters training at one place only, the gradient norm $\|\nabla T\|_{g^{-1}} = \sqrt{\nabla T^\top g^{-1} \nabla T}$, which is the field's predicted slowness. We minimise a symmetric penalty on $q = \|\nabla T\|_{g^{-1}}/s$, uniquely minimised by the Eikonal equation, at collocation points resampled every step; no solved field is available to the model.
+
+Its manifold-specific part is therefore \emph{verifiable} rather than merely tunable. Because $\mathrm{Log}_b$, $J_b$, and $g^{-1}$ are determined by $\mathcal{M}$ rather than chosen, each admits an exact test needing no ground truth and no training: $\mathrm{Exp}_b(\mathrm{Log}_b(x)) = x$, $\|\mathrm{Log}_b(x)\| = d_\mathcal{M}(b,x)$, $J_b$ against automatic differentiation, and $\|\nabla d_\mathcal{M}\|_g = 1$, the exact residual the solver minimises. All twenty checks pass across five environments to within $2.3\times10^{-10}$ in double precision, so a wrong curvature term fails before training rather than surfacing later as a mediocre error. A coordinate projection admits no comparable criterion: it is a choice, not a consequence, and its failure is silent. On $SO(3)$ that route is additionally obstructed, since no continuous representation of $SO(3)$ exists in four or fewer dimensions \cite{zhou2019continuity}, whereas \eqref{eq:rsrm} needs no representation of it at all.
+
+\begin{table}[t]
+\centering
+\caption{The entire manifold-specific part of an \ac{RSRM}. Here $\theta$ and $r$ denote geodesic distance, $u = (-b) \oplus x$ M\"obius addition, and $q$ a unit quaternion.}
+\label{tab:geometry}
+\footnotesize
+\begin{tabular}{lcccc}
+\hline
+$\mathcal{M}$ & $K$ & $\mathrm{Log}_b(x)$ & $J_b(x)$ & $g^{-1}(x)$ \\
+\hline
+$T^n$    & $0$            & $\mathrm{wrap}(x-b)$                  & $1$                                                 & $I$ \\
+$S^n$    & $+1$           & $\theta \, e_\perp$                   & $(\theta/\sin\theta)^{n-1}$                         & $I - xx^\top$ \\
+$H^d$    & $-1$           & $r \, u/\|u\|$                        & $(r/\sinh r)^{d-1}$                                 & $\left(\tfrac{1-\|x\|^2}{2}\right)^{2} I$ \\
+$SO(3)$  & $\tfrac{1}{4}$ & $\mathrm{axis\text{-}angle}(b^{-1}x)$ & $\left(\tfrac{\theta/2}{\sin(\theta/2)}\right)^{2}$ & $\tfrac{1}{4}(I - qq^\top)$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Implementation Details}
+
+Points use each manifold's natural representation: chart angles on $T^n$, unit vectors on $S^n$, Poincar\'e ball coordinates on $H^d$, and unit quaternions on $SO(3)$, where the $\pm q$ identification enters $\mathrm{Log}_b$ and $d_\mathcal{M}$ and nowhere else. Scenes are geodesic balls or caps with smooth slowness $s(x) = 1 + (s_{\max}-1)\,\sigma(-\mathrm{sdf}(x)/w)$. We train for 4000 steps on 2048 collocation points resampled each step, using AdamW at learning rate $3\times10^{-3}$ with gradient clipping.
+
+The model chooses its own capacity. From 128 splats we periodically prune negligible weights and spawn new splats at the highest-residual free-space samples, stopping when a pass buys less than a fixed fractional residual reduction \emph{per splat added} on two consecutive passes. Normalising by both the residual and the splats added lets one threshold transfer across manifolds and scenes. A fixed-width \ac{MLP} has no analogue, as every weight affects the whole domain.
+
+Three numerical details are load-bearing. Distances use half-angle forms, $2\arcsin(\|x-b\|/2)$ and its hyperbolic counterpart, rather than clipped $\arccos$ and $\mathrm{arccosh}$, which impose a floor of $4.5\times10^{-2}$ on distance precisely where the field is anchored at the source. Centres are retracted onto $\mathcal{M}$ after each optimiser step, since a wrapped Gaussian is undefined for a centre off the manifold; normalising inside the density instead makes the loss scale-invariant, leaves nothing to oppose weight decay, and diverges. Covariance singular values are floored, without which a splat collapses onto the non-smooth Eikonal kink and produces an unbounded $\|\nabla T\|$. Fields are scored against fast marching computed only after training, relative to $T = d_\mathcal{M}$, which is both the score for learning nothing and the model's own initialisation.

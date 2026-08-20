@@ -12,5 +12,12 @@ logs
 validation.md
 mlflow.db
 figures/
-results/
+# `results/*` rather than `results/`: git does not descend into an excluded *directory*, so a
+# negation on files inside one never fires. Excluding the contents instead lets the write-up through.
+results/*
+# The write-up under results/ is source, not output — CLAUDE.md sends every reader to
+# results/experiments.md and results/training_strategy.md first. Figures, .npz and .pkl stay out,
+# since results/figures/ is itself matched by the rule above.
+!results/*.md
+!results/*.tex
 mlartifacts/

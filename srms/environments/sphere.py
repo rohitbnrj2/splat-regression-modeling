@@ -31,11 +31,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from srms.environments import marching
+from srms.environments.base import smooth_slowness, union_sdf, unit_geodesic_gradient
 
 Obstacle = tuple[float, ...]  # (*centre[dim] unit vector, angular radius)
 
 _OBSTACLE_SEED_OFFSET = 5
 _EPS = 1e-3
+_CUT_EPS = 1e-7  # keeps arcsin off its infinite-derivative endpoint at the cut locus
 
 
 # ---- n-sphere geometry primitives (JAX) ------------------------------------------------------
@@ -67,12 +69,44 @@ def _sphere_frame(mu: jnp.ndarray, n: int) -> jnp.ndarray:
 
 
 def _theta_perp(mu: jnp.ndarray, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Geodesic distance theta and unit tangent direction e_perp from mu toward x."""
-    cos_theta = jnp.clip(jnp.dot(mu, x), -1.0 + _EPS, 1.0 - _EPS)
-    theta = jnp.arccos(cos_theta)
+    """Geodesic distance theta and unit tangent direction e_perp from mu toward x.
+
+    theta via the half-angle identity ||x-mu||^2 = 4 sin^2(theta/2), i.e. theta = 2 arcsin(||x-mu||/2).
+    arcsin has a bounded derivative at 0, so nothing is needed near theta=0 -- the previous clipped
+    arccos reported a distance of 4.47e-2 between a point and itself.
+
+    Both guards below are for the **cut locus** (theta = pi, x antipodal to mu), and both were live
+    defects that NaN'd sphere training within 60 steps:
+
+    1. ``perp = x - cos(theta)*mu`` vanishes exactly at the antipode, and dividing by a floored norm
+       returned the **zero vector** rather than a unit one. ``log_map`` was then 0, so the splat
+       evaluated an antipodal point as if it sat at its own centre: measured density 2.04e8 where the
+       true value is ~1e-18. Any unit tangent is a correct e_perp there (the direction is genuinely
+       undefined, and the Gaussian factor is e^-40 regardless), so one is constructed explicitly.
+    2. ``arcsin`` reaches argument 1 exactly at the antipode, where its derivative is infinite, so
+       ``d/dB`` came back NaN. Clipping the argument to ``1 - _CUT_EPS`` bounds it at ~2.2e3 and caps
+       theta at pi - 9e-4, which moves the density by less than float32 can represent.
+    """
+    chord = jnp.linalg.norm(x - mu)
+    theta = 2.0 * jnp.arcsin(jnp.clip(0.5 * chord, 0.0, 1.0 - _CUT_EPS))
+    cos_theta = 1.0 - 0.5 * chord * chord
     perp = x - cos_theta * mu
-    e_perp = perp / jnp.maximum(jnp.linalg.norm(perp), 1e-8)
-    return theta, e_perp
+    norm_perp = jnp.linalg.norm(perp)
+    degenerate = norm_perp < 1e-6
+    return theta, jnp.where(degenerate, _any_unit_tangent(mu), perp / jnp.where(degenerate, 1.0, norm_perp))
+
+
+def _any_unit_tangent(mu: jnp.ndarray) -> jnp.ndarray:
+    """Some unit vector orthogonal to mu; used only where the tangent direction is undefined.
+
+    Projects two different basis axes off mu and takes whichever is better conditioned, so the result
+    is never near-zero regardless of where mu points. jit/grad safe: both are always computed.
+    """
+    basis = jnp.eye(mu.shape[0])
+    first = basis[:, 0] - mu[0] * mu
+    second = basis[:, 1] - mu[1] * mu
+    candidate = jnp.where(jnp.linalg.norm(first) > 0.5, first, second)
+    return candidate / jnp.linalg.norm(candidate)
 
 
 def wrap(angle: jnp.ndarray) -> jnp.ndarray:
@@ -100,7 +134,7 @@ class SphereEnvironment:
         self.dim = self.n + 1
         self.tangent_dim = self.n
         self.domain: tuple[float, float] = (-1.0, 1.0)
-        self.axis_labels: tuple[str, str] = ("ψ longitude (deg)", "θ colatitude (deg)")
+        self.axis_labels: tuple[str, str] = (r"$\psi$ longitude (deg)", r"$\theta$ colatitude (deg)")
         self.render_extent: tuple[float, float, float, float] = (-180.0, 180.0, 0.0, 180.0)
         self.has_dense_gt = self.n in (2, 3)
         self.obstacles: tuple[Obstacle, ...] = self._sample_obstacles()
@@ -205,8 +239,12 @@ class SphereEnvironment:
 
     def geodesic(self, x: jnp.ndarray, start: jnp.ndarray) -> jnp.ndarray:
         """Analytic great-circle distance arccos(<start, x>) (the known base)."""
-        cos_theta = jnp.clip(jnp.sum(x * start, axis=-1), -1.0 + 1e-7, 1.0 - 1e-7)
-        return jnp.arccos(cos_theta)
+        chord = jnp.linalg.norm(x - start, axis=-1)
+        return 2.0 * jnp.arcsin(jnp.clip(0.5 * chord, 0.0, 1.0))
+
+    def grad_geodesic(self, x: jnp.ndarray) -> jnp.ndarray:
+        """``∇base`` at x — closed form, so ``base`` is never differentiated (see base.py)."""
+        return unit_geodesic_gradient(self, x)
 
     # ---- obstacle / slowness field -----------------------------------------
 
@@ -217,11 +255,11 @@ class SphereEnvironment:
             centre, radius = jnp.array(obs[:-1]), obs[-1]
             cos_theta = jnp.clip(points @ centre, -1.0 + 1e-7, 1.0 - 1e-7)
             per.append(jnp.arccos(cos_theta) - radius)
-        return jnp.min(jnp.stack(per, axis=0), axis=0)
+        return union_sdf(per, points.shape[0])
 
     def slowness(self, points: jnp.ndarray) -> jnp.ndarray:
         """Smooth slowness: ~1 in free space, rising to slowness_max inside obstacles."""
-        return 1.0 + (self.slowness_max - 1.0) * jax.nn.sigmoid(-self.sdf(points) / self.slow_width)
+        return smooth_slowness(self.sdf(points), self.slowness_max, self.slow_width)
 
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy signed distance (host-side, for RRT*'s hot loop)."""
@@ -230,12 +268,11 @@ class SphereEnvironment:
             centre, radius = np.array(obs[:-1]), obs[-1]
             cos_theta = np.clip(points @ centre, -1.0 + 1e-7, 1.0 - 1e-7)
             per.append(np.arccos(cos_theta) - radius)
-        return np.min(per, axis=0)
+        return union_sdf(per, len(points), np)
 
     def slowness_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy smooth slowness (host-side, for RRT*'s hot loop)."""
-        sdf = self.sdf_np(points)
-        return 1.0 + (self.slowness_max - 1.0) / (1.0 + np.exp(sdf / self.slow_width))
+        return smooth_slowness(self.sdf_np(points), self.slowness_max, self.slow_width, np)
 
     # ---- sampling / ground truth --------------------------------------------
 

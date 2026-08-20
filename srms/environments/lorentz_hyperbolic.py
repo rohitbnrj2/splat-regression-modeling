@@ -41,6 +41,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from srms.environments.base import smooth_slowness, union_sdf, unit_geodesic_gradient
+
 Obstacle = tuple[float, ...]  # (*origin[dim], *direction[dim], length, thickness) — a capsule-
 # thickened geodesic ray: {cosh(t)*origin + sinh(t)*direction : t in [0, length]}, direction an
 # eta-unit tangent vector at origin.
@@ -135,10 +137,15 @@ def _dist_perp(mu: jnp.ndarray, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarra
     sinh(d)^2 = c^2-1, computed directly from the single already-clipped c — always >= ~2*eps,
     comfortably bounded away from zero by construction, no independent recomputation to cancel.
     """
-    c = jnp.minimum(mink_dot(mu, x), -1.0 - _EPS)
-    d = jnp.arccosh(-c)
+    # d via the half-angle identity <x-y,x-y>_eta = 4 sinh^2(d/2), i.e. d = 2 arcsinh(||x-y||_eta/2).
+    # arcsinh has a bounded derivative at 0, so unlike arccosh this needs no clip and has no floor:
+    # the previous form reported d(x,x) = arccosh(1+1e-3) = 4.47e-2 rather than 0, making every
+    # distance below that unrepresentable -- right where the field is anchored at the source.
+    diff = x - mu
+    d = 2.0 * jnp.arcsinh(0.5 * jnp.sqrt(jnp.maximum(mink_dot(diff, diff), 0.0)))
+    c = -jnp.cosh(d)  # consistent with d by construction, so perp stays cancellation-free
     perp = x + c * mu
-    perp_norm = jnp.sqrt(c * c - 1.0)  # = sinh(d), consistent with c by construction (see above)
+    perp_norm = jnp.maximum(jnp.sinh(d), _EPS)  # = sinh(d); floored only as a divisor, not in d
     e_perp = perp / perp_norm
     return d, e_perp
 
@@ -286,6 +293,45 @@ class LorentzHyperbolicEnvironment:
         d, e_perp = _dist_perp(mu, x)
         return d * e_perp
 
+    def exp_map(self, mu: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+        """Exp_mu(v) from tangent-frame coordinates v (size tangent_dim) -- inverse of log_map.
+
+        Lifts v through the same frame log_map projects onto, then walks the geodesic
+        cosh(d)*mu + sinh(d)*direction, the hyperboloid counterpart of the sphere's great circle.
+        Exists so ``environments/test_manifolds.py`` can check Exp(Log(x)) == x, which is the one
+        identity that catches log and exp disagreeing.
+        """
+        ambient = _lorentz_frame(mu, self.n) @ v
+        norm = jnp.sqrt(jnp.maximum(mink_dot(ambient, ambient), 0.0))
+        direction = ambient / jnp.maximum(norm, 1e-12)
+        return jnp.cosh(norm) * mu + jnp.sinh(norm) * direction
+
+    def splat_precompute(self, mu: jnp.ndarray):
+        """Per-splat geometry the per-point loop must not rebuild: the eta-orthonormal frame at mu.
+
+        Args:
+            mu: Splat centre on the hyperboloid, [dim].
+
+        Returns:
+            ``(mu, frame)`` for ``log_and_jac``. Mirrors ``SphereEnvironment.splat_precompute``;
+            without it ``srm.eval_raw`` raises and this environment cannot be trained at all.
+        """
+        return mu, _lorentz_frame(mu, self.n)
+
+    def log_and_jac(self, pre, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """(log_map, jac_factor) sharing one ``_dist_perp`` call instead of two.
+
+        Args:
+            pre: The ``(mu, frame)`` pair from ``splat_precompute``.
+            x: Query point, [dim].
+
+        Returns:
+            Tangent-frame coordinates [tangent_dim] and the scalar volume correction.
+        """
+        mu, frame = pre
+        d, e_perp = _dist_perp(mu, x)
+        return d * _mink_dot_cols(e_perp, frame), _d_over_sinh(d) ** (self.n - 1)
+
     def jac_factor(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         """|det d(log_map)/dx| = (d/sinh d)^(n-1), the inverse Riemannian volume element on H^n.
 
@@ -321,8 +367,8 @@ class LorentzHyperbolicEnvironment:
 
     def geodesic(self, x: jnp.ndarray, start: jnp.ndarray) -> jnp.ndarray:
         """Analytic geodesic distance arccosh(-<x,start>_eta) (the known base)."""
-        c = jnp.minimum(mink_dot(x, start), -1.0 - _EPS)
-        return jnp.arccosh(-c)
+        diff = x - start
+        return 2.0 * jnp.arcsinh(0.5 * jnp.sqrt(jnp.maximum(mink_dot(diff, diff), 0.0)))
 
     def wrap_point(self, x: jnp.ndarray) -> jnp.ndarray:
         """Renormalize onto the hyperboloid sheet via eta (Lorentz analog of the sphere's
@@ -362,6 +408,10 @@ class LorentzHyperbolicEnvironment:
 
     # ---- obstacle / slowness field -----------------------------------------
 
+    def grad_geodesic(self, x: jnp.ndarray) -> jnp.ndarray:
+        """``∇base`` at x — closed form, so ``base`` is never differentiated (see base.py)."""
+        return unit_geodesic_gradient(self, x)
+
     def sdf(self, points: jnp.ndarray) -> jnp.ndarray:
         """Signed geodesic distance to the union of capsule-thickened obstacle rays."""
         per = []
@@ -370,11 +420,11 @@ class LorentzHyperbolicEnvironment:
             direction = jnp.array(obs[self.dim : 2 * self.dim])
             length, thickness = obs[-2], obs[-1]
             per.append(_ray_dist(points, origin, direction, length) - thickness)
-        return jnp.min(jnp.stack(per, axis=0), axis=0)
+        return union_sdf(per, points.shape[0])
 
     def slowness(self, points: jnp.ndarray) -> jnp.ndarray:
         """Smooth slowness: ~1 in free space, rising to slowness_max inside obstacles."""
-        return 1.0 + (self.slowness_max - 1.0) * jax.nn.sigmoid(-self.sdf(points) / self.slow_width)
+        return smooth_slowness(self.sdf(points), self.slowness_max, self.slow_width)
 
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy signed distance (host-side, for RRT*'s hot loop)."""
@@ -384,12 +434,11 @@ class LorentzHyperbolicEnvironment:
             direction = np.array(obs[self.dim : 2 * self.dim])
             length, thickness = obs[-2], obs[-1]
             per.append(_ray_dist_np(points, origin, direction, length) - thickness)
-        return np.min(per, axis=0)
+        return union_sdf(per, len(points), np)
 
     def slowness_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy smooth slowness (host-side, for RRT*'s hot loop)."""
-        sdf = self.sdf_np(points)
-        return 1.0 + (self.slowness_max - 1.0) / (1.0 + np.exp(sdf / self.slow_width))
+        return smooth_slowness(self.sdf_np(points), self.slowness_max, self.slow_width, np)
 
     # ---- sampling --------------------------------------------------------
 

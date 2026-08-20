@@ -43,9 +43,11 @@ import sys
 import jax
 import jax.numpy as jnp
 import numpy as np
+from scipy.special import gammainc
 
 from srms.environments import ENVIRONMENTS
 from srms.lib.manifold_splat import eval_wrapped_gaussian
+from srms.methods.backends import srm
 
 jax.config.update("jax_enable_x64", True)  # exactness checks, not training
 
@@ -169,6 +171,75 @@ def check_normalisation(env, scale: float, seed: int) -> float:
     return float(jnp.mean(density * weight))
 
 
+def check_grad_base(env, x) -> float:
+    """7. ``‖∇base‖_g == 1``: the closed-form geodesic gradient is a unit covector.
+
+    ``base`` is never differentiated by autodiff — ``env.grad_geodesic`` supplies its gradient in
+    closed form — so this identity is what stands behind that substitution. It is checked at points
+    *including the cut locus*, which is exactly where autodiff fails: on S² the derivative of
+    ``2·arcsin(chord/2)`` is unbounded as the chord approaches 2, so autodiff evaluates ``0 x inf``
+    at the antipode and returns NaN, which NaN'd sphere training within 60 steps.
+
+    Args:
+        env: Environment under test.
+        x: Query points, [n, dim].
+
+    Returns:
+        Max absolute deviation of the metric norm from 1; ``inf`` if any value is non-finite.
+    """
+    grad = jax.vmap(env.grad_geodesic)(jnp.asarray(x))
+    metric = jax.vmap(env.metric_inv)(jnp.asarray(x))
+    norm = jnp.sqrt(jnp.einsum("ni,nij,nj->n", grad, metric, grad))
+    if not bool(jnp.all(jnp.isfinite(norm))):
+        return float("inf")
+    return float(jnp.max(jnp.abs(norm - 1.0)))
+
+
+def far_points(env, n: int, seed: int):
+    """``n`` points over the manifold, weighted toward the ones farthest from the source.
+
+    ``sample_pairs``/``points_near_source`` both bound the separation, so neither reaches the far
+    side — which is precisely where the geodesic's autodiff gradient fails. This finds the far side
+    empirically, by sampling a large pool and keeping the most distant quarter, rather than
+    constructing an antipode analytically. That construction is not manifold-agnostic: ``-start`` is
+    the *same* rotation in SO(3), which is S³ quotiented by ±1, and lands on the wrong sheet of the
+    hyperboloid in the Lorentz model. Sorting by ``env.geodesic`` is correct everywhere and needs no
+    per-manifold knowledge of where — or whether — a cut locus exists.
+    """
+    rng = np.random.default_rng(seed)
+    points = env.sample_domain(rng, n)
+    pool = env.sample_domain(rng, 40 * n)
+    distance = np.asarray(env.geodesic(jnp.asarray(pool, dtype=jnp.float64), jnp.asarray(env.start, jnp.float64)))
+    farthest = pool[np.argsort(distance)[-(n // 4) :]]
+    return jnp.asarray(np.concatenate([points, farthest]), dtype=jnp.float64)
+
+
+def check_backend(env, mu, x, scale: float = 0.35) -> float:
+    """6. The trained backend's density equals the reference wrapped Gaussian.
+
+    ``srms/methods/backends/srm.py`` does not call ``eval_wrapped_gaussian``: it inlines the same
+    formula batched over splats and points, hoisting the per-splat frame into ``splat_precompute``
+    and fusing log map with Jacobian into ``log_and_jac``. Those are three chances to disagree with
+    the definition, none of which any other check touches, so this compares them directly.
+
+    Args:
+        env: Environment under test.
+        mu: Splat centres, [n, dim].
+        x: Query points, [n, dim].
+        scale: Isotropic tangent scale for the single test splat.
+
+    Returns:
+        Max absolute relative difference between backend and reference density.
+    """
+    A = scale * jnp.eye(env.tangent_dim, dtype=jnp.float64)
+    reference = jax.vmap(lambda m, p: eval_wrapped_gaussian(p, m, A, env.log_map, env.jac_factor, env.tangent_dim))(
+        mu, x
+    )
+    weights = jnp.ones((1, 1), dtype=jnp.float64)
+    backend = jax.vmap(lambda m, p: srm.eval_raw((weights, A[None], m[None]), p[None, :], env)[0, 0])(mu, x)
+    return float(jnp.max(jnp.abs(backend - reference) / (jnp.abs(reference) + 1e-12)))
+
+
 def containment_mass(env, scale: float) -> tuple[float, str]:
     """Closed-form N(0, scale²·I) mass inside the tangent region that maps injectively onto the
     *integrated* part of the manifold, plus the name of what bounds that region.
@@ -185,13 +256,18 @@ def containment_mass(env, scale: float) -> tuple[float, str]:
     shows the *largest* shortfall in the table while being the only exact representation of the
     three, which is why cause is reported alongside magnitude.
 
-    dim=2 closed forms; this file only constructs dim=2 environments.
+    For a *ball*-shaped D of radius R in a ``tangent_dim``-dimensional tangent space the mass is the
+    chi distribution's CDF, i.e. the regularised lower incomplete gamma ``P(d/2, R²/2σ²)``. Writing it
+    that way rather than per-manifold matters: the 2-D special case ``1 − exp(−R²/2σ²)`` was being
+    applied to SO(3) too, whose tangent space is 3-D, and predicted 0.9675 where the correct chi₃
+    value is 0.9233 against a measured 0.9225 — a failure that was the *formula's*, not the model's.
+    The torus's D is a box, not a ball, so it keeps its own per-axis product.
     """
     if hasattr(env, "trunc_radius"):
         # Hyperbolic: bounded by our own truncation, not by curvature (see docstring).
-        return 1.0 - math.exp(-(env.wall_distance**2) / (2 * scale**2)), "domain truncation (our choice)"
+        return gammainc(env.tangent_dim / 2, env.wall_distance**2 / (2 * scale**2)), "domain truncation (our choice)"
     if env.tangent_dim < env.dim:
-        return 1.0 - math.exp(-(math.pi**2) / (2 * scale**2)), "antipodal cut locus (curvature)"
+        return gammainc(env.tangent_dim / 2, math.pi**2 / (2 * scale**2)), "antipodal cut locus (curvature)"
     return math.erf(math.pi / (scale * math.sqrt(2.0))) ** env.tangent_dim, "half-period cut locus"
 
 
@@ -199,20 +275,35 @@ def main() -> int:
     rows: list[tuple[str, str, float, str]] = []
     mass_rows: list[tuple[str, float, float, float, float, str]] = []
     failures = 0
-    for name in ("torus", "sphere", "hyperbolic"):
-        env = ENVIRONMENTS[name](n=2) if name == "sphere" else ENVIRONMENTS[name](dim=2)
-        mu, x = sample_pairs(env, 200, seed=0, max_sep=1.8)
-        near_source = points_near_source(env, 200, seed=1, lo=0.4, hi=1.8)
+    # Each environment names its own intrinsic-dimension argument; SO(3) has none.
+    build = {
+        "torus": lambda: ENVIRONMENTS["torus"](dim=2),
+        "sphere": lambda: ENVIRONMENTS["sphere"](n=2),
+        "so3": lambda: ENVIRONMENTS["so3"](),
+        "poincare_hyperbolic": lambda: ENVIRONMENTS["poincare_hyperbolic"](dim=2),
+        "lorentz_hyperbolic": lambda: ENVIRONMENTS["lorentz_hyperbolic"](n=2),
+    }
+    for name, make in build.items():
+        env = make()
+        sep = 2.4 if name == "so3" else 1.8
+        mu, x = sample_pairs(env, 200, seed=0, max_sep=sep)
+        near_source = points_near_source(env, 200, seed=1, lo=0.4, hi=sep)
         exact = {
             "round trip": check_round_trip(env, mu, x),
             "isometry": check_isometry(env, mu, x),
             "jacobian": check_jacobian(env, mu, x),
             "eikonal ‖∇d‖_g=1": check_eikonal(env, near_source),
+            "backend == reference": check_backend(env, mu, x),
+            "‖∇base‖_g=1 (cut locus)": check_grad_base(env, far_points(env, 300, seed=3)),
         }
         for label, value in exact.items():
             ok = abs(value) < EXACT_TOL
             failures += not ok
             rows.append((name, label, value, "PASS" if ok else "FAIL"))
+        if not hasattr(env, "volume"):
+            # An environment that does not declare its sampling region's Riemannian volume cannot be
+            # mass-checked; the exact identities above still apply and are the load-bearing ones.
+            continue
         for scale in (NARROW, WIDE):
             measured = check_normalisation(env, scale, seed=2)
             predicted, cause = containment_mass(env, scale)
@@ -231,7 +322,7 @@ def main() -> int:
     for name, scale, measured, predicted, delta, cause in mass_rows:
         print(f"{name:<12} {scale:>5.1f} {measured:>10.4f} {predicted:>10.4f} {delta:>10.1e}  {cause}")
 
-    print(f"\n{failures} failure(s) across {3 * 4} exact identities and {3 * 2} mass checks.")
+    print(f"\n{failures} failure(s) across {len(rows)} exact identities and {len(mass_rows)} mass checks.")
     print(
         "Read the mass table by *cause*, not by size: the torus and sphere lose tail mass to a cut\n"
         "locus, which is a limit of the wrapped-Gaussian representation on those manifolds. Hyperbolic\n"

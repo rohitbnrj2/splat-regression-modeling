@@ -36,8 +36,10 @@ ALLOWED_ENV_ATTRS = {
     "sdf_np",
     "obstacles",
     "start",
+    "in_domain_np",  # chart membership, a property of the domain definition
     # analytic geometry — closed form, no fast marching involved
     "geodesic",
+    "grad_geodesic",  # closed-form gradient of the analytic geodesic; no solver, same status as `geodesic`
     "metric_inv",
     "log_map",
     "log_map_ambient",
@@ -101,14 +103,15 @@ def check_dynamic(strategies: dict, manifolds: list[tuple[str, dict]]) -> list[s
                 densify=False,
                 num_splats=16,
                 tau_min=0.01,
+                init_weight=1e-2,  # `eikonal` refuses a dead V=0 init; harmless to the others
             )
-            env = ENVIRONMENTS[env_name](**kwargs)
 
             def trap(*args, _m=method, _e=env_name, **kwargs):
                 raise AssertionError(f"{_m} on {_e} called env.ground_truth during solve")
 
-            env.ground_truth = trap  # type: ignore[method-assign]
             try:
+                env = ENVIRONMENTS[env_name](**kwargs)
+                env.ground_truth = trap  # type: ignore[method-assign]
                 strategy.solve(env, cfg, BACKENDS["srm"])
             except AssertionError as exc:
                 bad.append(str(exc))
@@ -120,10 +123,16 @@ def check_dynamic(strategies: dict, manifolds: list[tuple[str, dict]]) -> list[s
 
 def main() -> int:
     root = pathlib.Path(__file__).resolve().parents[2]
-    from srms.methods.strategies import eikonal, ntfields, pntfields
+    from srms.methods.strategies import eikonal, factored, ntfields, pntfields
 
-    strategies = {"eikonal": eikonal, "ntfields": ntfields, "pntfields": pntfields}
-    manifolds = [("torus", {"dim": 2}), ("sphere", {"n": 2}), ("hyperbolic", {"dim": 2}), ("so3", {})]
+    strategies = {"eikonal": eikonal, "factored": factored, "ntfields": ntfields, "pntfields": pntfields}
+    manifolds = [
+        ("torus", {"dim": 2}),
+        ("sphere", {"n": 2}),
+        ("poincare_hyperbolic", {"dim": 2}),
+        ("lorentz_hyperbolic", {"n": 2}),
+        ("so3", {}),
+    ]
 
     print("1. static: no 'ground_truth' anywhere under srms/methods")
     static = check_static(root)
